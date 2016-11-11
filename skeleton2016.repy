@@ -1,0 +1,495 @@
+# ------------------------------------------------------------------------------     
+# Start listening and handle incoming connections in board() function
+# ------------------------------------------------------------------------------     
+def start_board():
+    ip = mycontext['ip']
+    port = mycontext['port']
+    print "Listening on IP " + str(ip) +" port " + str(port)
+    try: 
+        listencommhandle = waitforconn(ip, port, board_connection_handler)
+    except Exception, e:
+        print "Exception in start_board: %s, %s\n" %(type(e), e)
+        raise
+        #pass
+
+# ------------------------------------------------------------------------------             
+# Called when an incoming message is received. 
+# --> Important starting point
+# ------------------------------------------------------------------------------             
+def board_connection_handler(ip, port, sockobj, thiscommhandle, listencommhandle):
+    try:
+        msgheader = sockobj.recv(1024) # Receive message
+        
+        # React depending on message type: HTTP GET or POST, or some other type of communication.
+        if msgheader.startswith( 'GET' ):
+            get_board_handler(msgheader, sockobj, thiscommhandle)
+        elif msgheader.startswith( 'POST' ):
+            post_board_handler(msgheader, sockobj, thiscommhandle)
+        elif msgheader.startswith( 'ADD' ):
+            add_board_handler(msgheader, sockobj, thiscommhandle)
+        elif msgheader.startswith( 'MODIFY' ):
+            modify_board_handler(msgheader, sockobj, thiscommhandle)
+        elif msgheader.startswith( 'DELETE' ):
+            delete_board_handler(msgheader, sockobj, thiscommhandle)
+        else:
+            print '****Request:\n%s' % msgheader
+            other_requests_handler(msgheader, sockobj, thiscommhandle)
+
+    except Exception, e:
+        print "Exception in board: %s, %s\n" %(type(e), e)
+        #raise
+
+# ------------------------------------------------------------------------------
+# Handles initial GET request from browser, outputs HTML string and closes socket.
+# ------------------------------------------------------------------------------
+def get_board_handler(msgheader, sockobj, thiscommhandle):
+    htmlresponse = generate_html_page()
+    res=make_http_response(200, 'OK', htmlresponse)
+    sockobj.send(res)
+    stopcomm(thiscommhandle) 
+
+# ------------------------------------------------------------------------------
+# Handles entry POSTing requests to the blackboard.
+# ------------------------------------------------------------------------------
+def post_board_handler(msgheader, sockobj, thiscommhandle):
+    template = '<html><head><style>.status {color: %s;font-size: 75%%;}</style></head><body><pre><samp class="status">%s</samp></pre></body><html>'
+    query = extract_http_request_contents(msgheader)
+    params = extract_parameters_from_query(query)
+    if 'entry' not in params:
+        htmlresponse = template % ("red", "No entry in POST")
+        res = make_http_response(400, 'Bad Request', htmlresponse)
+        sockobj.send(res)
+        stopcomm(thiscommhandle)
+        return
+
+    # Extract msgid and msg
+    msgid = len(mycontext['entries']) + 1
+    msg = params['entry']
+    msg_urlencoded = urllib_quote_plus(msg)
+
+    # Should we add, modify or delete?
+    if 'delete' in params:
+        msgid = int(params['id'])
+        if params['delete'] == '1':
+            nmsg = "DELETE\n%d" % (msgid)
+            del mycontext['entries'][msgid]
+        else:
+            nmsg = "MODIFY\n%d\n%s" % (msgid, msg_urlencoded)
+            mycontext['entries'][msgid] = msg
+    else:
+        nmsg = "ADD\n%d\n%s" % (msgid, msg_urlencoded)
+        mycontext['entries'][msgid] = msg
+
+    # Don't keep the client waiting, so respond before we sync
+    htmlresponse = template % ("green", nmsg)
+    res = make_http_response(200, 'OK', htmlresponse)
+    sockobj.send(res)
+    stopcomm(thiscommhandle)
+
+    # Notify all other blackboards about the change
+    for neighbor in mycontext['neighborlist']:
+        try:
+            nsock = openconn(neighbor['ip'], neighbor['port'])
+            nsock.send(nmsg)
+            rsock = nsock.recv(2)
+            nsock.close()
+        except Exception, e:
+            print "Exception when syncing: %s, %s\n" %(type(e), e)
+
+
+# ------------------------------------------------------------------------------
+# Handles syncing new entries between clients
+# ------------------------------------------------------------------------------
+def add_board_handler(msgheader, sockobj, thiscommhandle):
+    lines = msgheader.splitlines()
+    msgid = int(lines[1])
+    msg = urllib_unquote_plus(lines[2])
+    mycontext['entries'][msgid] = msg
+    sockobj.send('OK')
+    stopcomm(thiscommhandle)
+
+# ------------------------------------------------------------------------------
+# Handles syncing changes to entries between clients
+# ------------------------------------------------------------------------------
+def modify_board_handler(msgheader, sockobj, thiscommhandle):
+    lines = msgheader.splitlines()
+    msgid = int(lines[1])
+    msg = urllib_unquote_plus(lines[2])
+    mycontext['entries'][msgid] = msg
+    sockobj.send('OK')
+    stopcomm(thiscommhandle)
+
+# ------------------------------------------------------------------------------
+# Handles deleting entries between clients
+# ------------------------------------------------------------------------------
+def delete_board_handler(msgheader, sockobj, thiscommhandle):
+    lines = msgheader.splitlines()
+    msgid = int(lines[1])
+    del mycontext['entries'][msgid]
+    sockobj.send('OK')
+    stopcomm(thiscommhandle)
+
+# ------------------------------------------------------------------------------
+# Handles other requests, outputs 404
+# ------------------------------------------------------------------------------
+def other_requests_handler(msgheader, sockobj, thiscommhandle):
+    # extract the query from the HTTP request 
+    query = extract_http_request_contents(msgheader)
+    print query
+    # extract the query parameters
+    parameters = extract_parameters_from_query(query)
+    print parameters
+    print parameters['entry']
+    
+    # Do not mix HTML code with the server code as done here. This is a bad practice
+    template='<html><head><style>.status {color: red;font-size: 75%%;}</style></head><body><pre><samp class="status">%s</samp></pre></body><html>'
+    htmlresponse = template % ("404 Not Found\n" + msgheader)
+    res=make_http_response(404, 'Not Found', htmlresponse)
+    sockobj.send(res)
+    stopcomm(thiscommhandle) 
+
+# ------------------------------------------------------------------------------
+# Wrap into HTTP headers
+# ------------------------------------------------------------------------------
+def make_http_response(status, status_text, htmlresponse):
+    response_template = "HTTP/1.1 %d %s\r\nContent-type: text/html\r\nContent-length: %i\r\n\r\n%s"
+    return response_template % (status, status_text, len(htmlresponse), htmlresponse)
+
+# ------------------------------------------------------------------------------
+# Utility function to extract the contents (payload) from HTTP request
+# ------------------------------------------------------------------------------
+def extract_http_request_contents(header):
+    # find content length
+    conent_length = header.split('Content-Length: ')[1]
+    conent_length = int(conent_length.split('\r\n')[0])
+    
+    # extract the http response body and discard the header
+    contetns = header[-conent_length:]
+    return contetns
+
+# ------------------------------------------------------------------------------
+# Utility function to extract query parameter from HTML query
+# ------------------------------------------------------------------------------
+def extract_parameters_from_query(msg):
+    # extract the query parameters as a dictionary: {name:value}
+    # example input format: comment=aa&ip=127.0.0.1&port=63101&action=Delete
+    parameters={}
+    arr = msg.split('&')
+    for a in arr:
+        pp = a.split('=')
+        if len(pp)>1:
+            parameters[pp[0]] = urllib_unquote_plus(pp[1])
+    return parameters
+
+# ------------------------------------------------------------------------------
+# Outputs the blackboard html 
+# ------------------------------------------------------------------------------     
+def generate_html_page():
+    #Initialize blackboard content
+    
+    entries = []
+    for msgid in mycontext['entries']:
+        msg = mycontext['entries'][msgid]
+        entries.append(mycontext['entry_template'] %('entries/%d' % (msgid), msgid, msg))
+    entriesStr = "".join(entries)
+
+    # dynamic title showing Ip address, port and up time. 
+    title='Sample board @ %s:%d. Up time: %d' %( str(mycontext['ip']), mycontext['port'], int(getruntime()) )
+    content = mycontext['boardcontents_template'] %( title, entriesStr )
+    fullpage_h = mycontext['frontpage_header_template'] + content
+    fullpage = fullpage_h + mycontext['frontpage_footer_template'] % mycontext['authors']
+    #print entriesStr, content, fullpage
+    return fullpage
+    
+# ------------------------------------------------------------------------------             
+# Main entry point of the program. Initalizes global variables in mycontext
+# and calls start_board() which opens a socket for incoming connections.
+# ------------------------------------------------------------------------------
+if callfunc == 'initialize':
+    # whenever this vessel gets a connection on its IP:port it'll call function board_connection_handler
+    if len(callargs) == 1 or len(callargs) == 2:
+        port = int(callargs[0])
+        if len(callargs) == 2:
+            ip=str(callargs[1])
+        else:
+            try:
+             ip = getmyip()
+            except Exception, e:
+             print "Could not get an IP\n"
+             print (type(e), e)
+             raise
+    
+    # Fail if we don't have 1 or 2 arguments    
+    else:
+        raise Exception("Usage: python <path to repy.py> <path to restrictions.default> skeleton2016.repy <port> [ip (optional)]")
+
+    mycontext['entries'] = {}
+
+    #Initialize Port and IP
+    mycontext['port'] = port
+    mycontext['ip'] = ip
+    
+    #read html template files
+    mycontext['entry_template'] = file("entry_template.html").read()
+    mycontext['boardcontents_template'] = file("boardcontents_template.html").read()
+    mycontext['frontpage_header_template'] = file("board_frontpage_header_template.html").read()
+    mycontext['frontpage_footer_template'] = file("board_frontpage_footer_template.html").read()
+ 
+    # Read neighbors
+    mycontext['neighborlist'] = []
+    for neighbor in file("neighborlist.txt").read().splitlines():
+        ipport = neighbor.split(':')
+        nip = ipport[0]
+        nport = int(ipport[1])
+        if nip != ip or nport != port:
+            mycontext['neighborlist'].append({'ip': nip, 'port': nport})
+
+    mycontext['authors'] = "Rafael Mohlin (mrafael@student.chalmers.se)"
+
+    # e = Exception("ex");
+    # try:
+    # print "%s, %s\n" %(type(e), e)
+    # except Exception, ee:
+    # print ee
+
+    start_board()
+
+# ----------------------------------------------------------------------------
+# urllib.repy
+# include urllib.repy doesn't work, if fails with the error
+# Exception (with type 'exceptions.ValueError'): Code failed safety check! Error: ("<type 'exceptions.SyntaxError'> invalid syntax (line lineNrAfterIncludeStatment)",)
+
+def urllib_quote(inputstring, safestring="/"):
+  """
+  <Purpose>
+    Encode an inputstring such that it can be used safely in a URL or XML
+    document.
+
+  <Arguments>
+    inputstring:
+           The string to urlencode.
+
+    safestring (optional):
+           Specifies additional characters that should not be quoted --
+           defaults to "/".
+
+  <Exceptions>
+    TypeError if the inputstring or safestring parameters aren't strings.
+
+  <Side Effects>
+    None.
+
+  <Returns>
+    Urlencoded version of the passed string.
+  """
+
+  if type(inputstring) is not str:
+    raise TypeError("urllib_quote's inputstring parameter must be a string, not '"+str(type(inputstring))+"'")
+  if type(safestring) is not str:
+    raise TypeError("urllib_quote's safestring parameter must be a string, not '"+str(type(safestring))+"'")
+  
+
+  resultstr = ""
+
+  # We go through each character in the string; if it's not in [0-9a-zA-Z]
+  # we wrap it.
+
+  safeset = set(safestring)
+
+  for char in inputstring:
+    asciicode = ord(char)
+    if (asciicode >= ord("0") and asciicode <= ord("9")) or \
+        (asciicode >= ord("A") and asciicode <= ord("Z")) or \
+        (asciicode >= ord("a") and asciicode <= ord("z")) or \
+        asciicode == ord("_") or asciicode == ord(".") or \
+        asciicode == ord("-") or char in safeset:
+      resultstr += char
+    else:
+      resultstr += "%%%02X" % asciicode
+
+  return resultstr
+
+
+
+
+def urllib_quote_plus(inputstring, safestring=""):
+  """
+  <Purpose>
+    Encode a string to go in the query fragment of a URL.
+
+  <Arguments>
+    inputstring:
+           The string to urlencode.
+
+    safestring (optional):
+           Specifies additional characters that should not be quoted --
+           defaults to the empty string.
+
+  <Exceptions>
+    TypeError if the inputstring or safestring parameters aren't strings.
+
+  <Side Effects>
+    None.
+
+  <Returns>
+    Urlencoded version of the passed string.
+  """
+
+  if type(inputstring) is not str:
+    raise TypeError("urllib_quote_plus' inputstring parameter must be a string, not '"+str(type(inputstring))+"'")
+  if type(safestring) is not str:
+    raise TypeError("urllib_quote_plus' safestring parameter must be a string, not '"+str(type(safestring))+"'")
+  
+
+  return urllib_quote(inputstring, safestring + " ").replace(" ", "+")
+
+
+
+
+def urllib_unquote(inputstring):
+  """
+  <Purpose>
+    Unquote a urlencoded string.
+
+  <Arguments>
+    inputstring:
+           The string to unquote.
+
+  <Exceptions>
+    TypeError if the inputstring isn't a string
+    ValueError thrown if the last wrapped octet isn't a valid wrapped octet
+    (i.e. if the string ends in "%" or "%x" rather than "%xx". Also throws
+    ValueError if the nibbles aren't valid hex digits.
+
+  <Side Effects>
+    None.
+
+  <Returns>
+    The decoded string.
+  """
+
+  if type(inputstring) is not str:
+    raise TypeError("urllib_unquote's inputstring parameter must be a string, not '"+str(type(inputstring))+"'")
+  
+
+  resultstr = ""
+
+  # We go through the inputstring from end to beginning, looking for wrapped
+  # octets. When one is found we add it (unwrapped) and the following
+  # string to the resultant string, and shorten the original inputstring.
+
+  while True:
+    lastpercentlocation = inputstring.rfind("%")
+    if lastpercentlocation < 0:
+      break
+
+    wrappedoctetstr = inputstring[lastpercentlocation+1:lastpercentlocation+3]
+    if len(wrappedoctetstr) != 2:
+      raise ValueError("Quoted string is poorly formed")
+
+    resultstr = \
+        chr(int(wrappedoctetstr, 16)) + \
+        inputstring[lastpercentlocation+3:] + \
+        resultstr
+    inputstring = inputstring[:lastpercentlocation]
+
+  resultstr = inputstring + resultstr
+  return resultstr
+
+
+
+
+def urllib_unquote_plus(inputstring):
+  """
+  <Purpose>
+    Unquote the urlencoded query fragment of a URL.
+
+  <Arguments>
+    inputstring:
+           The string to unquote.
+
+  <Exceptions>
+    TypeError if the inputstring isn't a string
+    ValueError thrown if the last wrapped octet isn't a valid wrapped octet
+    (i.e. if the inputstring ends in "%" or "%x" rather than "%xx". Also throws
+    ValueError if the nibbles aren't valid hex digits.
+
+  <Side Effects>
+    None.
+
+  <Returns>
+    The decoded string.
+  """
+  if type(inputstring) is not str:
+    raise TypeError("urllib_unquote_plus' inputstring parameter must be a string, not '"+str(type(inputstring))+"'")
+
+  return urllib_unquote(inputstring.replace("+", " "))
+
+
+
+
+def urllib_quote_parameters(inputdictionary):
+  """
+  <Purpose>
+    Encode a dictionary of (key, value) pairs into an HTTP query string or
+    POST body (same form).
+
+  <Arguments>
+    dictionary:
+           The dictionary to quote.
+
+  <Exceptions>
+    TypeError if the inputdictionary isn't a dict.
+
+  <Side Effects>
+    None.
+
+  <Returns>
+    The quoted dictionary.
+  """
+  if type(inputdictionary) is not dict:
+    raise TypeError("urllib_quote_parameters' inputstringdictionary parameter must be a dict, not '"+str(type(inputstring))+"'")
+
+  quoted_keyvals = []
+  for key, val in inputdictionary.items():
+    quoted_keyvals.append("%s=%s" % (urllib_quote(key), urllib_quote(val)))
+
+  return "&".join(quoted_keyvals)
+
+
+
+
+def urllib_unquote_parameters(inputstring):
+  """
+  <Purpose>
+    Decode a urlencoded query string or POST body.
+
+  <Arguments>
+    inputstring:
+           The string to decode.
+
+  <Exceptions>
+    TypeError if the inputstring isn't a string
+    ValueError if the inputstring is poorly formed.
+
+  <Side Effects>
+    None.
+
+  <Returns>
+    A dictionary mapping keys to values.
+  """
+
+  if type(inputstring) is not str:
+    raise TypeError("urllib_unquote_parameters' inputstring parameter must be a string, not '"+str(type(inputstring))+"'")
+
+  keyvalpairs = inputstring.split("&")
+  res = {}
+
+  for quotedkeyval in keyvalpairs:
+    # Throw ValueError if there is more or less than one '='.
+    quotedkey, quotedval = quotedkeyval.split("=")
+    key = urllib_unquote_plus(quotedkey)
+    val = urllib_unquote_plus(quotedval)
+    res[key] = val
+
+  return res
