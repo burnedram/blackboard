@@ -19,7 +19,7 @@ def start_board():
 def board_connection_handler(ip, port, sockobj, thiscommhandle, listencommhandle):
     try:
         msgheader = sockobj.recv(1024) # Receive message
-        
+
         # React depending on message type: HTTP GET or POST, or some other type of communication.
         if msgheader.startswith( 'GET' ):
             get_board_handler(msgheader, sockobj, thiscommhandle)
@@ -31,6 +31,8 @@ def board_connection_handler(ip, port, sockobj, thiscommhandle, listencommhandle
             modify_board_handler(msgheader, sockobj, thiscommhandle)
         elif msgheader.startswith( 'DELETE' ):
             delete_board_handler(msgheader, sockobj, thiscommhandle)
+        elif msgheader.startswith( 'ELECTION' ):
+            handle_election(msgheader, sockobj, thiscommhandle)
         else:
             print '****Request:\n%s' % msgheader
             other_requests_handler(msgheader, sockobj, thiscommhandle)
@@ -46,7 +48,7 @@ def get_board_handler(msgheader, sockobj, thiscommhandle):
     htmlresponse = generate_html_page()
     res=make_http_response(200, 'OK', htmlresponse)
     sockobj.send(res)
-    stopcomm(thiscommhandle) 
+    stopcomm(thiscommhandle)
 
 # ------------------------------------------------------------------------------
 # Handles entry POSTing requests to the blackboard.
@@ -87,15 +89,28 @@ def post_board_handler(msgheader, sockobj, thiscommhandle):
     stopcomm(thiscommhandle)
 
     # Notify all other blackboards about the change
+    send_to_neighbors(nmsg)
+
+def send_to_neighbors(msg, silent=False):
+    conns = []
     for neighbor in mycontext['neighborlist']:
+        if neighbor['ip'] == mycontext['ip'] and neighbor['port'] == mycontext['port']:
+            continue
         try:
             nsock = openconn(neighbor['ip'], neighbor['port'])
-            nsock.send(nmsg)
+            nsock.send(msg)
+            conns.append(nsock)
+        except Exception, e:
+            if not silent:
+                print "Exception in send_to_neighbors [%s:%d]: %s, %s\n" %(neighbor['ip'], neighbor['port'], type(e), e)
+    for nsock in conns:
+        try:
+            # Assume we receive an "OK"
             rsock = nsock.recv(2)
             nsock.close()
         except Exception, e:
-            print "Exception when syncing: %s, %s\n" %(type(e), e)
-
+            if not silent:
+                print "Exception in send_to_neighbors [%s:%d]: %s, %s\n" %(neighbor['ip'], neighbor['port'], type(e), e)
 
 # ------------------------------------------------------------------------------
 # Handles syncing new entries between clients
@@ -140,13 +155,126 @@ def other_requests_handler(msgheader, sockobj, thiscommhandle):
     parameters = extract_parameters_from_query(query)
     print parameters
     print parameters['entry']
-    
+
     # Do not mix HTML code with the server code as done here. This is a bad practice
     template='<html><head><style>.status {color: red;font-size: 75%%;}</style></head><body><pre><samp class="status">%s</samp></pre></body><html>'
     htmlresponse = template % ("404 Not Found\n" + msgheader)
     res=make_http_response(404, 'Not Found', htmlresponse)
     sockobj.send(res)
-    stopcomm(thiscommhandle) 
+    stopcomm(thiscommhandle)
+
+# ------------------------------------------------------------------------------
+# Are we the leader in our centralized system?
+# ------------------------------------------------------------------------------
+def is_leader():
+    return (mycontext['leader'] is not None and 
+        mycontext['leader']['ip'] == mycontext['ip'] and 
+        mycontext['leader']['port'] == mycontext['port'])
+
+def is_in_election():
+    return mycontext['is_in_election']
+
+# ------------------------------------------------------------------------------
+# Checks if we need to elect a new leader, preferably run this on a set interval
+# ------------------------------------------------------------------------------
+def should_elect_new_leader():
+    if mycontext['leader'] is None:
+        return True
+    if is_leader():
+        return False
+    if is_in_election():
+        return False
+    if not ping(mycontext['leader']):
+        return True
+    return False
+
+def log(msg):
+    if 'logid' not in mycontext:
+        mycontext['logid'] = 1000
+    mycontext['entries'][mycontext['logid']] = msg
+    mycontext['logid'] = mycontext['logid'] + 1
+
+def start_election():
+    mycontext['is_in_election'] = True
+    election_str = "ELECTION\n%s %d %f" % (mycontext['ip'], mycontext['port'], mycontext['election_priority'])
+    if not send_to_next_in_election_ring(election_str):
+        # No other nodes responded, so we are the sole survivor in our network
+        mycontext['is_in_election'] = False
+        leader = {'ip': mycontext['ip'], 'port': mycontext['port'], 'priority': mycontext['election_priority']}
+        mycontext['leader'] = leader
+
+def send_to_next_in_election_ring(election_str):
+    local_neighborlist_election = mycontext['neighborlist_election']
+    my_index = get_index_in_election_ring()
+    candidate_index = my_index
+    while True:
+        candidate_index = get_next_in_election_ring(local_neighborlist_election, candidate_index)
+        if candidate_index == my_index:
+            return False
+        candidate = mycontext['neighborlist'][candidate_index]
+        if send_election(candidate, election_str):
+            return True
+
+def get_index_in_election_ring():
+    for idx in range(len(mycontext['neighborlist'])):
+        neighbor = mycontext['neighborlist'][idx]
+        if neighbor['ip'] == mycontext['ip'] and neighbor['port'] == mycontext['port']:
+            return idx
+    raise Exception('Node not in neighborlist\n%s:%d\n%s' % (mycontext['ip'], mycontext['port'], str(mycontext['neighborlist'])))
+
+def get_next_in_election_ring(local_neighborlist_election, neighbor_idx):
+    if local_neighborlist_election is None:
+        neighbor_idx = neighbor_idx + 1
+        return neighbor_idx % len(mycontext['neighborlist'])
+    else:
+        election_idx = None
+        for idx, neighbor in enumerate(local_neighborlist_election):
+            if neighbor['idx'] == neighbor_idx:
+                election_idx = idx
+                break
+        if election_idx is None:
+            raise Exception('BOOOORK')
+        election_idx = election_idx + 1
+        if election_idx == len(local_neighborlist_election):
+            # We should ignore those who are beneath us
+            return get_index_in_election_ring()
+        return mycontext['neighborlist'][election_idx]['idx']
+
+def send_election(candidate, election_str):
+    try:
+        nsock = openconn(candidate['ip'], candidate['port'])
+        nsock.send(election_str)
+        rsock = nsock.recv(2)
+        nsock.close()
+        return True
+    except Exception, e:
+        #print "Exception in send_election: %s, %s\n" %(type(e), e)
+        return False
+
+def handle_election(msgheader, sockobj, thiscommhandle):
+    candidates = msgheader.splitlines()[1:]
+    if candidates[0].startswith("%s %d" % (mycontext['ip'], mycontext['port'])):
+        # Our election has come back to us
+        if mycontext['is_in_election']:
+            mycontext['is_in_election'] = False
+            results = []
+            for candi in candidates:
+                candistr = candi.split(' ')
+                results.append({'ip': candistr[0], 'port': int(candistr[1]), 'priority': float(candistr[2])})
+            results.sort(reverse = True, key = itemgetter_priority)
+            # Save the results for future use when deciding closes neighbor
+            mycontext['neighborlist_election'] = results
+            leader = results[0]
+            mycontext['leader'] = leader
+    else:
+        # Append us to the election list
+        msgheader = msgheader + "\n%s %d %f" % (mycontext['ip'], mycontext['port'], mycontext['election_priority'])
+        send_to_next_in_election_ring(msgheader)
+    sockobj.send('OK')
+    stopcomm(thiscommhandle)
+
+def itemgetter_priority(x):
+    return x['priority']
 
 # ------------------------------------------------------------------------------
 # Wrap into HTTP headers
@@ -162,7 +290,7 @@ def extract_http_request_contents(header):
     # find content length
     conent_length = header.split('Content-Length: ')[1]
     conent_length = int(conent_length.split('\r\n')[0])
-    
+
     # extract the http response body and discard the header
     contetns = header[-conent_length:]
     return contetns
@@ -186,7 +314,7 @@ def extract_parameters_from_query(msg):
 # ------------------------------------------------------------------------------     
 def generate_html_page():
     #Initialize blackboard content
-    
+
     entries = []
     for msgid in mycontext['entries']:
         msg = mycontext['entries'][msgid]
@@ -194,13 +322,42 @@ def generate_html_page():
     entriesStr = "".join(entries)
 
     # dynamic title showing Ip address, port and up time. 
-    title='Sample board @ %s:%d. Up time: %d' %( str(mycontext['ip']), mycontext['port'], int(getruntime()) )
-    content = mycontext['boardcontents_template'] %( title, entriesStr )
+    title='Board [%f] @ %s:%d. Up time: %d' %( mycontext['election_priority'], str(mycontext['ip']), mycontext['port'], int(getruntime()) )
+    if mycontext['leader'] is not None:
+        leader = 'Current leader: %s:%d [%f]' % (mycontext['leader']['ip'], mycontext['leader']['port'], mycontext['leader']['priority'])
+    elif mycontext['is_in_election']:
+        leader = 'Election in progress...'
+    else:
+        leader = 'No current leader'
+    content = mycontext['boardcontents_template'] %( title, leader, entriesStr )
     fullpage_h = mycontext['frontpage_header_template'] + content
     fullpage = fullpage_h + mycontext['frontpage_footer_template'] % mycontext['authors']
     #print entriesStr, content, fullpage
     return fullpage
-    
+
+
+# ------------------------------------------------------------------------------
+# Create all variables that we assume exists
+# ------------------------------------------------------------------------------     
+def init_env():
+    # Empty blackboard
+    mycontext['entries'] = {}
+
+    # Read neighbors
+    # neighborlist contains ourself as well, which is important to remember
+    mycontext['neighborlist'] = []
+    for neighbor in file("neighborlist.txt").read().splitlines():
+        ipport = neighbor.split(':')
+        nip = ipport[0]
+        nport = int(ipport[1])
+        mycontext['neighborlist'].append({'ip': nip, 'port': nport})
+
+    mycontext['leader'] = None
+    mycontext['is_in_election'] = False
+    mycontext['election_priority'] = randomfloat()
+    mycontext['neighborlist_election'] = None
+
+
 # ------------------------------------------------------------------------------             
 # Main entry point of the program. Initalizes global variables in mycontext
 # and calls start_board() which opens a socket for incoming connections.
@@ -218,33 +375,24 @@ if callfunc == 'initialize':
              print "Could not get an IP\n"
              print (type(e), e)
              raise
-    
+
     # Fail if we don't have 1 or 2 arguments    
     else:
         raise Exception("Usage: python <path to repy.py> <path to restrictions.default> skeleton2016.repy <port> [ip (optional)]")
 
-    mycontext['entries'] = {}
-
     #Initialize Port and IP
     mycontext['port'] = port
     mycontext['ip'] = ip
-    
+
     #read html template files
     mycontext['entry_template'] = file("entry_template.html").read()
     mycontext['boardcontents_template'] = file("boardcontents_template.html").read()
     mycontext['frontpage_header_template'] = file("board_frontpage_header_template.html").read()
     mycontext['frontpage_footer_template'] = file("board_frontpage_footer_template.html").read()
- 
-    # Read neighbors
-    mycontext['neighborlist'] = []
-    for neighbor in file("neighborlist.txt").read().splitlines():
-        ipport = neighbor.split(':')
-        nip = ipport[0]
-        nport = int(ipport[1])
-        if nip != ip or nport != port:
-            mycontext['neighborlist'].append({'ip': nip, 'port': nport})
 
     mycontext['authors'] = "Rafael Mohlin (mrafael@student.chalmers.se)"
+
+    init_env()
 
     # e = Exception("ex");
     # try:
@@ -253,6 +401,10 @@ if callfunc == 'initialize':
     # print ee
 
     start_board()
+
+    # We should always start an election when we first spawn
+    # but wait until all nodes are up
+    settimer(10, start_election, [])
 
 # ----------------------------------------------------------------------------
 # urllib.repy
