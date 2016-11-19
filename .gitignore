@@ -1,6 +1,8 @@
 # repy autogen code
 demokit/*_repy.py
 
+test_multiple_instances.html
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
