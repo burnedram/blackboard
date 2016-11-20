@@ -33,6 +33,8 @@ def board_connection_handler(ip, port, sockobj, thiscommhandle, listencommhandle
             delete_board_handler(msgheader, sockobj, thiscommhandle)
         elif msgheader.startswith( 'ELECTION' ):
             handle_election(msgheader, sockobj, thiscommhandle)
+        elif msgheader.startswith( 'LEADER' ):
+            leader_handler(msgheader, sockobj, thiscommhandle)
         else:
             print '****Request:\n%s' % msgheader
             other_requests_handler(msgheader, sockobj, thiscommhandle)
@@ -64,32 +66,72 @@ def post_board_handler(msgheader, sockobj, thiscommhandle):
         stopcomm(thiscommhandle)
         return
 
-    # Extract msgid and msg
-    msgid = len(mycontext['entries']) + 1
+    # Drop request if we have no leader
+    if mycontext['leader'] is None:
+        htmlresponse = template % ("red", "Network has no leader, try again later")
+        res = make_http_response(202, 'Accepted', htmlresponse)
+        sockobj.send(res)
+        stopcomm(thiscommhandle)
+        return
+
+    # Extract msg
     msg = params['entry']
-    msg_urlencoded = urllib_quote_plus(msg)
 
     # Should we add, modify or delete?
     if 'delete' in params:
         msgid = int(params['id'])
         if params['delete'] == '1':
-            nmsg = "DELETE\n%d" % (msgid)
-            del mycontext['entries'][msgid]
+            delete_board_entry(msgid)
         else:
-            nmsg = "MODIFY\n%d\n%s" % (msgid, msg_urlencoded)
-            mycontext['entries'][msgid] = msg
+            modify_board_entry(msgid, msg)
     else:
-        nmsg = "ADD\n%d\n%s" % (msgid, msg_urlencoded)
-        mycontext['entries'][msgid] = msg
+        add_board_entry(msg)
 
-    # Don't keep the client waiting, so respond before we sync
-    htmlresponse = template % ("green", nmsg)
+    htmlresponse = template % ("green", "Post OK")
     res = make_http_response(200, 'OK', htmlresponse)
     sockobj.send(res)
     stopcomm(thiscommhandle)
 
-    # Notify all other blackboards about the change
-    send_to_neighbors(nmsg)
+def max_msgid(xs):
+    maxid = 0
+    for x in xs:
+        if x['msgid'] > maxid:
+            maxid = x['msgid']
+    return maxid
+
+def add_board_entry(msg):
+    if is_leader():
+        mycontext['board_lock'].acquire()
+        try:
+            msgid = max_msgid(mycontext['entries']) + 1
+            mycontext['entries'][msgid] = msg
+            send_to_neighbors('LEADER\nADD\n%d\n%s' % (msgid, urllib_quote_plus(msg)))
+        finally:
+            mycontext['board_lock'].release()
+    else:
+        send_to_leader('ADD\n%s' % (urllib_quote_plus(msg)))
+
+def modify_board_entry(msgid, msg):
+    if is_leader():
+        mycontext['board_lock'].acquire()
+        try:
+            mycontext['entries'][msgid] = msg
+            send_to_neighbors('LEADER\nMODIFY\n%d\n%s' % (msgid, urllib_quote_plus(msg)))
+        finally:
+            mycontext['board_lock'].release()
+    else:
+        send_to_leader('MODIFY\n%d\n%s' % (msgid, urllib_quote_plus(msg)))
+
+def delete_board_entry(msgid):
+    if is_leader():
+        mycontext['board_lock'].acquire()
+        try:
+            del mycontext['entries'][msgid]
+            send_to_neighbors('LEADER\nDELETE\n%d' % (msgid))
+        finally:
+            mycontext['board_lock'].release()
+    else:
+        send_to_leader('DELETE\n%d' % (msgid))
 
 def send_to_neighbors(msg, silent=False):
     conns = []
@@ -112,14 +154,23 @@ def send_to_neighbors(msg, silent=False):
             if not silent:
                 print "Exception in send_to_neighbors [%s:%d]: %s, %s\n" %(neighbor['ip'], neighbor['port'], type(e), e)
 
+def send_to_leader(msg):
+    try:
+        nsock = openconn(mycontext['leader']['ip'], mycontext['leader']['port'])
+        nsock.send(msg)
+        rsock = nsock.recv(2)
+        nsock.close()
+    except Exception, e:
+        print "Exception in send_to_leader, re-election? %s, %s\n" %(type(e), e)
+
 # ------------------------------------------------------------------------------
 # Handles syncing new entries between clients
 # ------------------------------------------------------------------------------
 def add_board_handler(msgheader, sockobj, thiscommhandle):
     lines = msgheader.splitlines()
-    msgid = int(lines[1])
-    msg = urllib_unquote_plus(lines[2])
-    mycontext['entries'][msgid] = msg
+    msg = urllib_unquote_plus(lines[1])
+    if is_leader():
+        add_board_entry(msg)
     sockobj.send('OK')
     stopcomm(thiscommhandle)
 
@@ -130,7 +181,8 @@ def modify_board_handler(msgheader, sockobj, thiscommhandle):
     lines = msgheader.splitlines()
     msgid = int(lines[1])
     msg = urllib_unquote_plus(lines[2])
-    mycontext['entries'][msgid] = msg
+    if is_leader():
+        modify_board_entry(msgid, msg)
     sockobj.send('OK')
     stopcomm(thiscommhandle)
 
@@ -140,7 +192,26 @@ def modify_board_handler(msgheader, sockobj, thiscommhandle):
 def delete_board_handler(msgheader, sockobj, thiscommhandle):
     lines = msgheader.splitlines()
     msgid = int(lines[1])
-    del mycontext['entries'][msgid]
+    if is_leader():
+        delete_board_entry(msgid)
+    sockobj.send('OK')
+    stopcomm(thiscommhandle)
+
+def leader_handler(msgheader, sockobj, thiscommhandle):
+    lines = msgheader.splitlines()
+    if lines[1] == 'ADD':
+        msgid = int(lines[2])
+        msg = urllib_unquote_plus(lines[3])
+        mycontext['entries'][msgid] = msg
+    elif lines[1] == 'MODIFY':
+        msgid = int(lines[2])
+        msg = urllib_unquote_plus(lines[3])
+        mycontext['entries'][msgid] = msg
+    elif lines[1] == 'DELETE':
+        msgid = int(lines[2])
+        del mycontext['entries'][msgid]
+    else:
+        print "Unknown method %s in leader_handler\n" % (lines[1])
     sockobj.send('OK')
     stopcomm(thiscommhandle)
 
@@ -203,8 +274,10 @@ def start_election():
         leader = {'ip': mycontext['ip'], 'port': mycontext['port'], 'priority': mycontext['election_priority']}
         mycontext['leader'] = leader
 
-def send_to_next_in_election_ring(election_str):
+def send_to_next_in_election_ring(election_str, priority=True):
     local_neighborlist_election = mycontext['neighborlist_election']
+    if not priority:
+        local_neighborlist_election = None
     my_index = get_index_in_election_ring()
     candidate_index = my_index
     while True:
@@ -227,18 +300,14 @@ def get_next_in_election_ring(local_neighborlist_election, neighbor_idx):
         neighbor_idx = neighbor_idx + 1
         return neighbor_idx % len(mycontext['neighborlist'])
     else:
-        election_idx = None
-        for idx, neighbor in enumerate(local_neighborlist_election):
-            if neighbor['idx'] == neighbor_idx:
-                election_idx = idx
-                break
+        election_idx = idx_index_of(local_neighborlist_election, neighbor_idx)
         if election_idx is None:
             raise Exception('BOOOORK')
         election_idx = election_idx + 1
         if election_idx == len(local_neighborlist_election):
             # We should ignore those who are beneath us
             return get_index_in_election_ring()
-        return mycontext['neighborlist'][election_idx]['idx']
+        return local_neighborlist_election[election_idx]['idx']
 
 def send_election(candidate, election_str):
     try:
@@ -248,7 +317,7 @@ def send_election(candidate, election_str):
         nsock.close()
         return True
     except Exception, e:
-        #print "Exception in send_election: %s, %s\n" %(type(e), e)
+        print "Exception in send_election: %s, %s\n" %(type(e), e)
         return False
 
 def handle_election(msgheader, sockobj, thiscommhandle):
@@ -260,7 +329,10 @@ def handle_election(msgheader, sockobj, thiscommhandle):
             results = []
             for candi in candidates:
                 candistr = candi.split(' ')
-                results.append({'ip': candistr[0], 'port': int(candistr[1]), 'priority': float(candistr[2])})
+                candii = {'ip': candistr[0], 'port': int(candistr[1]), 'priority': float(candistr[2])}
+                idx = ipport_index_of(mycontext['neighborlist'], candii)
+                candii['idx'] = idx
+                results.append(candii)
             results.sort(reverse = True, key = itemgetter_priority)
             # Save the results for future use when deciding closes neighbor
             mycontext['neighborlist_election'] = results
@@ -269,9 +341,23 @@ def handle_election(msgheader, sockobj, thiscommhandle):
     else:
         # Append us to the election list
         msgheader = msgheader + "\n%s %d %f" % (mycontext['ip'], mycontext['port'], mycontext['election_priority'])
-        send_to_next_in_election_ring(msgheader)
+        send_to_next_in_election_ring(msgheader, priority=False)
     sockobj.send('OK')
     stopcomm(thiscommhandle)
+
+def idx_index_of(xs, x):
+    for idx in range(len(xs)):
+        xx = xs[idx]
+        if xx['idx'] == x:
+            return idx
+    return None
+
+def ipport_index_of(xs, x):
+    for idx in range(len(xs)):
+        xx = xs[idx]
+        if xx['ip'] == x['ip'] and xx['port'] == x['port']:
+            return idx
+    return None
 
 def itemgetter_priority(x):
     return x['priority']
@@ -352,6 +438,7 @@ def init_env():
         nport = int(ipport[1])
         mycontext['neighborlist'].append({'ip': nip, 'port': nport})
 
+    mycontext['board_lock'] = getlock()
     mycontext['leader'] = None
     mycontext['is_in_election'] = False
     mycontext['election_priority'] = randomfloat()
