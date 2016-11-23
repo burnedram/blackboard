@@ -132,9 +132,10 @@ def modify_board_entry(msgid, msg):
     if is_leader():
         mycontext['board_lock'].acquire()
         try:
-            mycontext['entries'][msgid] = msg
-            send_to_neighbors('LEADER\nMODIFY\n%d\n%s'
-                % (msgid, urllib_quote_plus(msg)))
+            if msgid in mycontext['entries']:
+                mycontext['entries'][msgid] = msg
+                send_to_neighbors('LEADER\nMODIFY\n%d\n%s'
+                    % (msgid, urllib_quote_plus(msg)))
         finally:
             mycontext['board_lock'].release()
     else:
@@ -149,8 +150,9 @@ def delete_board_entry(msgid):
     if is_leader():
         mycontext['board_lock'].acquire()
         try:
-            del mycontext['entries'][msgid]
-            send_to_neighbors('LEADER\nDELETE\n%d' % (msgid))
+            if msgid in mycontext['entries']:
+                del mycontext['entries'][msgid]
+                send_to_neighbors('LEADER\nDELETE\n%d' % (msgid))
         finally:
             mycontext['board_lock'].release()
     else:
