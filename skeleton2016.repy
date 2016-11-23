@@ -316,9 +316,17 @@ def is_leader():
         mycontext['leader']['ip'] == mycontext['ip'] and 
         mycontext['leader']['port'] == mycontext['port'])
 
+# ------------------------------------------------------------------------------
+# Used to calculate the time we should sleep between heartbeats.
+# Return an int between 5 and 15.
+# ------------------------------------------------------------------------------
 def get_next_heartbeat():
     return int(round(randomfloat() * 10)) + 5
 
+# ------------------------------------------------------------------------------
+# Starts an election if we have to, and schedules the method to run again
+# in the near future.
+# ------------------------------------------------------------------------------
 def leader_heartbeat():
     if should_elect_new_leader():
         start_election()
@@ -343,6 +351,9 @@ def should_elect_new_leader():
     finally:
         mycontext['election_lock'].release()
 
+# ------------------------------------------------------------------------------
+# Return true if the node responds with "PONG".
+# ------------------------------------------------------------------------------
 def ping(node):
     try:
         nsock = openconn(node['ip'], node['port'])
@@ -353,6 +364,9 @@ def ping(node):
     except Exception, e:
         return False
 
+# ------------------------------------------------------------------------------
+# Responds to "PING" requests with "PONG"
+# ------------------------------------------------------------------------------
 def handle_ping(msgheader, sockobj, thiscommhandle):
     sockobj.send("PONG")
     stopcomm(thiscommhandle)
