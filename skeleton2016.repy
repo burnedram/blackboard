@@ -35,6 +35,8 @@ def board_connection_handler(ip, port, sockobj, thiscommhandle, listencommhandle
             handle_election(msgheader, sockobj, thiscommhandle)
         elif msgheader.startswith( 'LEADER' ):
             leader_handler(msgheader, sockobj, thiscommhandle)
+        elif msgheader.startswith( 'PING' ):
+            handle_ping(msgheader, sockobj, thiscommhandle)
         else:
             print '****Request:\n%s' % msgheader
             other_requests_handler(msgheader, sockobj, thiscommhandle)
@@ -193,10 +195,16 @@ def send_to_neighbors(msg, silent=False):
 # Sends msg to the current leader.
 # ------------------------------------------------------------------------------
 def send_to_leader(msg):
-    if mycontext['leader'] is None:
+    leader = None
+    try:
+        mycontext['election_lock'].acquire()
+        leader = mycontext['leader']
+    finally:
+        mycontext['election_lock'].release()
+    if leader is None:
         return
     try:
-        nsock = openconn(mycontext['leader']['ip'], mycontext['leader']['port'])
+        nsock = openconn(leader['ip'], leader['port'])
         nsock.send(msg)
         rsock = nsock.recv(2)
         nsock.close()
@@ -246,10 +254,28 @@ def delete_board_handler(msgheader, sockobj, thiscommhandle):
 
 # ------------------------------------------------------------------------------
 # Handles 'LEADER' events. A 'LEADER' event is a message from the leader, and
-# should always be followed.
+# should always be followed, unless its submessage is 'NEW'. In that case
+# it is another node announcing the new leader it found.
 # ------------------------------------------------------------------------------
 def leader_handler(msgheader, sockobj, thiscommhandle):
     lines = msgheader.splitlines()
+    if lines[1] == 'NEW':
+        new_leader = {
+            'ip': lines[2],
+            'port': int(lines[3]),
+            'priority': float(lines[4])
+        }
+        try:
+            mycontext['election_lock'].acquire()
+            # Only accept the new leader if we don't have a leader,
+            # if the new leader has a larger priority,
+            # or if our current leader is unreachable.
+            if mycontext['leader'] is None or \
+                    mycontext['leader']['priority'] < new_leader['priority'] or \
+                    not ping(mycontext['leader']):
+                mycontext['leader'] = new_leader
+        finally:
+            mycontext['election_lock'].release()
     if lines[1] == 'ADD':
         msgid = int(lines[2])
         msg = urllib_unquote_plus(lines[3])
@@ -307,6 +333,20 @@ def should_elect_new_leader():
     if not ping(mycontext['leader']):
         return True
     return False
+
+def ping(node):
+    try:
+        nsock = openconn(node['ip'], node['port'])
+        nsock.send("PING")
+        rsock = nsock.recv(4)
+        nsock.close()
+        return rsock == "PONG"
+    except Exception, e:
+        return False
+
+def handle_ping(msgheader, sockobj, thiscommhandle):
+    sockobj.send("PONG")
+    stopcomm(thiscommhandle)
 
 # ------------------------------------------------------------------------------
 # Used for debugging purposes. Adds a new log entry to the board.
@@ -418,6 +458,7 @@ def send_to_node(node, msg):
 def handle_election(msgheader, sockobj, thiscommhandle):
     candidates = msgheader.splitlines()[1:]
     if candidates[0].startswith("%s %d" % (mycontext['ip'], mycontext['port'])):
+        new_leader = None
         try:
             mycontext['election_lock'].acquire()
             # Our election has come back to us
@@ -437,10 +478,17 @@ def handle_election(msgheader, sockobj, thiscommhandle):
                 results.sort(reverse = True, key = itemgetter_priority)
                 # Save the results for future use when deciding closes neighbor
                 mycontext['neighborlist_election'] = results
-                leader = results[0]
-                mycontext['leader'] = leader
+                new_leader = results[0]
+                if mycontext['leader'] is None or \
+                        mycontext['leader']['priority'] < new_leader['priority']:
+                    mycontext['leader'] = new_leader
+                else:
+                    new_leader = None
         finally:
             mycontext['election_lock'].release()
+        if new_leader is not None:
+            send_to_neighbors("LEADER\nNEW\n%s\n%d\n%f"
+                % (new_leader['ip'], new_leader['port'], new_leader['priority']))
     else:
         # Append us to the election list
         msgheader = msgheader + "\n%s %d %f" \
@@ -614,7 +662,8 @@ if callfunc == 'initialize':
 
     # We should always start an election when we first spawn
     # but wait until all nodes are up
-    settimer(10, start_election, [])
+    #settimer(10, start_election, [])
+    start_election()
 
 # ----------------------------------------------------------------------------
 # urllib.repy
