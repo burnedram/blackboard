@@ -54,6 +54,8 @@ def get_board_handler(msgheader, sockobj, thiscommhandle):
 
 # ------------------------------------------------------------------------------
 # Handles entry POSTing requests to the blackboard.
+# If 'delete' is present in the query parameters,
+# it will either delete or modify the entry.
 # ------------------------------------------------------------------------------
 def post_board_handler(msgheader, sockobj, thiscommhandle):
     template = '<html><head><style>.status {color: %s;font-size: 75%%;}</style></head><body><pre><samp class="status">%s</samp></pre></body><html>'
@@ -92,36 +94,57 @@ def post_board_handler(msgheader, sockobj, thiscommhandle):
     sockobj.send(res)
     stopcomm(thiscommhandle)
 
+# ------------------------------------------------------------------------------
+# Helper function for add_board_entry.
+# Return the largest key in the dictionary array xs.
+# ------------------------------------------------------------------------------
 def max_msgid(xs):
     maxid = 0
     for x in xs:
-        if x['msgid'] > maxid:
-            maxid = x['msgid']
+        if x > maxid:
+            maxid = x
     return maxid
 
+# ------------------------------------------------------------------------------
+# If this node is the leader, it adds msg to the board and tells all other
+# nodes about it.
+# If this node is note the leader, it will ask the leader to add it.
+# ------------------------------------------------------------------------------
 def add_board_entry(msg):
     if is_leader():
         mycontext['board_lock'].acquire()
         try:
             msgid = max_msgid(mycontext['entries']) + 1
             mycontext['entries'][msgid] = msg
-            send_to_neighbors('LEADER\nADD\n%d\n%s' % (msgid, urllib_quote_plus(msg)))
+            send_to_neighbors('LEADER\nADD\n%d\n%s'
+                % (msgid, urllib_quote_plus(msg)))
         finally:
             mycontext['board_lock'].release()
     else:
         send_to_leader('ADD\n%s' % (urllib_quote_plus(msg)))
 
+# ------------------------------------------------------------------------------
+# If this node is the leader, it modifies msgid
+# and tells all other nodes about it.
+# If this node is note the leader, it will ask the leader to modify it.
+# ------------------------------------------------------------------------------
 def modify_board_entry(msgid, msg):
     if is_leader():
         mycontext['board_lock'].acquire()
         try:
             mycontext['entries'][msgid] = msg
-            send_to_neighbors('LEADER\nMODIFY\n%d\n%s' % (msgid, urllib_quote_plus(msg)))
+            send_to_neighbors('LEADER\nMODIFY\n%d\n%s'
+                % (msgid, urllib_quote_plus(msg)))
         finally:
             mycontext['board_lock'].release()
     else:
         send_to_leader('MODIFY\n%d\n%s' % (msgid, urllib_quote_plus(msg)))
 
+# ------------------------------------------------------------------------------
+# If this node is the leader, it deletes msgig from the board and tells all other
+# nodes about it.
+# If this node is note the leader, it will ask the leader to delete it.
+# ------------------------------------------------------------------------------
 def delete_board_entry(msgid):
     if is_leader():
         mycontext['board_lock'].acquire()
@@ -133,10 +156,14 @@ def delete_board_entry(msgid):
     else:
         send_to_leader('DELETE\n%d' % (msgid))
 
+# ------------------------------------------------------------------------------
+# Sends msg to all _other_ neighbors.
+# ------------------------------------------------------------------------------
 def send_to_neighbors(msg, silent=False):
     conns = []
     for neighbor in mycontext['neighborlist']:
-        if neighbor['ip'] == mycontext['ip'] and neighbor['port'] == mycontext['port']:
+        if neighbor['ip'] == mycontext['ip'] and \
+                neighbor['port'] == mycontext['port']:
             continue
         try:
             nsock = openconn(neighbor['ip'], neighbor['port'])
@@ -144,7 +171,8 @@ def send_to_neighbors(msg, silent=False):
             conns.append(nsock)
         except Exception, e:
             if not silent:
-                print "Exception in send_to_neighbors [%s:%d]: %s, %s\n" %(neighbor['ip'], neighbor['port'], type(e), e)
+                print "Exception in send_to_neighbors [%s:%d]: %s, %s\n" \
+                    %(neighbor['ip'], neighbor['port'], type(e), e)
     for nsock in conns:
         try:
             # Assume we receive an "OK"
@@ -152,8 +180,12 @@ def send_to_neighbors(msg, silent=False):
             nsock.close()
         except Exception, e:
             if not silent:
-                print "Exception in send_to_neighbors [%s:%d]: %s, %s\n" %(neighbor['ip'], neighbor['port'], type(e), e)
+                print "Exception in send_to_neighbors [%s:%d]: %s, %s\n" \
+                    %(neighbor['ip'], neighbor['port'], type(e), e)
 
+# ------------------------------------------------------------------------------
+# Sends msg to the current leader.
+# ------------------------------------------------------------------------------
 def send_to_leader(msg):
     try:
         nsock = openconn(mycontext['leader']['ip'], mycontext['leader']['port'])
@@ -164,7 +196,8 @@ def send_to_leader(msg):
         print "Exception in send_to_leader, re-election? %s, %s\n" %(type(e), e)
 
 # ------------------------------------------------------------------------------
-# Handles syncing new entries between clients
+# Handles 'ADD' events. If this node is not the leader it will simply discard
+# the event.
 # ------------------------------------------------------------------------------
 def add_board_handler(msgheader, sockobj, thiscommhandle):
     lines = msgheader.splitlines()
@@ -175,7 +208,8 @@ def add_board_handler(msgheader, sockobj, thiscommhandle):
     stopcomm(thiscommhandle)
 
 # ------------------------------------------------------------------------------
-# Handles syncing changes to entries between clients
+# Handles 'MODIFY' events. If this node is not the leader it will simply discard
+# the event.
 # ------------------------------------------------------------------------------
 def modify_board_handler(msgheader, sockobj, thiscommhandle):
     lines = msgheader.splitlines()
@@ -187,7 +221,8 @@ def modify_board_handler(msgheader, sockobj, thiscommhandle):
     stopcomm(thiscommhandle)
 
 # ------------------------------------------------------------------------------
-# Handles deleting entries between clients
+# Handles 'DELETE' events. If this node is not the leader it will simply discard
+# the event.
 # ------------------------------------------------------------------------------
 def delete_board_handler(msgheader, sockobj, thiscommhandle):
     lines = msgheader.splitlines()
@@ -197,6 +232,10 @@ def delete_board_handler(msgheader, sockobj, thiscommhandle):
     sockobj.send('OK')
     stopcomm(thiscommhandle)
 
+# ------------------------------------------------------------------------------
+# Handles 'LEADER' events. A 'LEADER' event is a message from the leader, and
+# should always be followed.
+# ------------------------------------------------------------------------------
 def leader_handler(msgheader, sockobj, thiscommhandle):
     lines = msgheader.splitlines()
     if lines[1] == 'ADD':
@@ -247,6 +286,7 @@ def is_in_election():
 
 # ------------------------------------------------------------------------------
 # Checks if we need to elect a new leader, preferably run this on a set interval
+# Not currently used.
 # ------------------------------------------------------------------------------
 def should_elect_new_leader():
     if mycontext['leader'] is None:
@@ -259,21 +299,41 @@ def should_elect_new_leader():
         return True
     return False
 
+# ------------------------------------------------------------------------------
+# Used for debugging purposes. Adds a new log entry to the board.
+# ------------------------------------------------------------------------------
 def log(msg):
     if 'logid' not in mycontext:
-        mycontext['logid'] = 1000
+        mycontext['logid'] = -1
     mycontext['entries'][mycontext['logid']] = msg
-    mycontext['logid'] = mycontext['logid'] + 1
+    mycontext['logid'] = mycontext['logid'] - 1
 
+# ------------------------------------------------------------------------------
+# Starts an election by sending an 'ELECTION' event to the next available
+# neighbor.
+# ------------------------------------------------------------------------------
 def start_election():
     mycontext['is_in_election'] = True
-    election_str = "ELECTION\n%s %d %f" % (mycontext['ip'], mycontext['port'], mycontext['election_priority'])
-    if not send_to_next_in_election_ring(election_str):
+    election_str = "ELECTION\n%s %d %f" \
+        % (mycontext['ip'], mycontext['port'], mycontext['election_priority'])
+    if not send_to_next_in_election_ring(election_str, priority=False):
         # No other nodes responded, so we are the sole survivor in our network
         mycontext['is_in_election'] = False
-        leader = {'ip': mycontext['ip'], 'port': mycontext['port'], 'priority': mycontext['election_priority']}
+        leader = {
+            'ip': mycontext['ip'],
+            'port': mycontext['port'],
+            'priority': mycontext['election_priority']
+        }
         mycontext['leader'] = leader
 
+# ------------------------------------------------------------------------------
+# Sends election_str to the first available neighbor.
+# Tries all neighbors until one could be reached.
+#
+# If priority is not set it will not use the neighbor list that is sorted by
+# priority. This is used by the election algorithm, as we don't really care
+# who we send it to.
+# ------------------------------------------------------------------------------
 def send_to_next_in_election_ring(election_str, priority=True):
     local_neighborlist_election = mycontext['neighborlist_election']
     if not priority:
@@ -281,20 +341,30 @@ def send_to_next_in_election_ring(election_str, priority=True):
     my_index = get_index_in_election_ring()
     candidate_index = my_index
     while True:
-        candidate_index = get_next_in_election_ring(local_neighborlist_election, candidate_index)
+        candidate_index = get_next_in_election_ring(
+            local_neighborlist_election,
+            candidate_index)
         if candidate_index == my_index:
             return False
         candidate = mycontext['neighborlist'][candidate_index]
-        if send_election(candidate, election_str):
+        if send_to_node(candidate, election_str):
             return True
 
+# ------------------------------------------------------------------------------
+# Gets our position in the neighbor list.
+# ------------------------------------------------------------------------------
 def get_index_in_election_ring():
     for idx in range(len(mycontext['neighborlist'])):
         neighbor = mycontext['neighborlist'][idx]
         if neighbor['ip'] == mycontext['ip'] and neighbor['port'] == mycontext['port']:
             return idx
-    raise Exception('Node not in neighborlist\n%s:%d\n%s' % (mycontext['ip'], mycontext['port'], str(mycontext['neighborlist'])))
+    raise Exception('Node not in neighborlist\n%s:%d\n%s'
+        % (mycontext['ip'], mycontext['port'], str(mycontext['neighborlist'])))
 
+# ------------------------------------------------------------------------------
+# Gets the next neighbor in either the neighbor list or the neighbor list
+# sorted by priority.
+# ------------------------------------------------------------------------------
 def get_next_in_election_ring(local_neighborlist_election, neighbor_idx):
     if local_neighborlist_election is None:
         neighbor_idx = neighbor_idx + 1
@@ -309,17 +379,23 @@ def get_next_in_election_ring(local_neighborlist_election, neighbor_idx):
             return get_index_in_election_ring()
         return local_neighborlist_election[election_idx]['idx']
 
-def send_election(candidate, election_str):
+# ------------------------------------------------------------------------------
+# Sends msg to node.
+# ------------------------------------------------------------------------------
+def send_to_node(node, msg):
     try:
-        nsock = openconn(candidate['ip'], candidate['port'])
-        nsock.send(election_str)
+        nsock = openconn(node['ip'], node['port'])
+        nsock.send(msg)
         rsock = nsock.recv(2)
         nsock.close()
         return True
     except Exception, e:
-        print "Exception in send_election: %s, %s\n" %(type(e), e)
+        print "Exception in send_to_node: %s, %s\n" %(type(e), e)
         return False
 
+# ------------------------------------------------------------------------------
+# Handles 'ELECTION' events.
+# ------------------------------------------------------------------------------
 def handle_election(msgheader, sockobj, thiscommhandle):
     candidates = msgheader.splitlines()[1:]
     if candidates[0].startswith("%s %d" % (mycontext['ip'], mycontext['port'])):
@@ -329,7 +405,11 @@ def handle_election(msgheader, sockobj, thiscommhandle):
             results = []
             for candi in candidates:
                 candistr = candi.split(' ')
-                candii = {'ip': candistr[0], 'port': int(candistr[1]), 'priority': float(candistr[2])}
+                candii = {
+                    'ip': candistr[0],
+                    'port': int(candistr[1]),
+                    'priority': float(candistr[2])
+                }
                 idx = ipport_index_of(mycontext['neighborlist'], candii)
                 candii['idx'] = idx
                 results.append(candii)
@@ -340,11 +420,16 @@ def handle_election(msgheader, sockobj, thiscommhandle):
             mycontext['leader'] = leader
     else:
         # Append us to the election list
-        msgheader = msgheader + "\n%s %d %f" % (mycontext['ip'], mycontext['port'], mycontext['election_priority'])
+        msgheader = msgheader + "\n%s %d %f" \
+            % (mycontext['ip'], mycontext['port'], mycontext['election_priority'])
         send_to_next_in_election_ring(msgheader, priority=False)
     sockobj.send('OK')
     stopcomm(thiscommhandle)
 
+# ------------------------------------------------------------------------------
+# Helper method for get_next_in_election_ring.
+# Returns the position of x in xs' 'idx' entry. 
+# ------------------------------------------------------------------------------
 def idx_index_of(xs, x):
     for idx in range(len(xs)):
         xx = xs[idx]
@@ -352,6 +437,10 @@ def idx_index_of(xs, x):
             return idx
     return None
 
+# ------------------------------------------------------------------------------
+# Helper method for handle_election.
+# Returns the position in xs where ip and port is equal to x
+# ------------------------------------------------------------------------------
 def ipport_index_of(xs, x):
     for idx in range(len(xs)):
         xx = xs[idx]
@@ -359,6 +448,9 @@ def ipport_index_of(xs, x):
             return idx
     return None
 
+# ------------------------------------------------------------------------------
+# Helper method for handle_election.
+# ------------------------------------------------------------------------------
 def itemgetter_priority(x):
     return x['priority']
 
@@ -408,9 +500,16 @@ def generate_html_page():
     entriesStr = "".join(entries)
 
     # dynamic title showing Ip address, port and up time. 
-    title='Board [%f] @ %s:%d. Up time: %d' %( mycontext['election_priority'], str(mycontext['ip']), mycontext['port'], int(getruntime()) )
+    title='Board [%f] @ %s:%d. Up time: %d' \
+        %( mycontext['election_priority'],
+           str(mycontext['ip']),
+           mycontext['port'],
+           int(getruntime()) )
     if mycontext['leader'] is not None:
-        leader = 'Current leader: %s:%d [%f]' % (mycontext['leader']['ip'], mycontext['leader']['port'], mycontext['leader']['priority'])
+        leader = 'Current leader: %s:%d [%f]' \
+            % (mycontext['leader']['ip'],
+               mycontext['leader']['port'],
+               mycontext['leader']['priority'])
     elif mycontext['is_in_election']:
         leader = 'Election in progress...'
     else:
