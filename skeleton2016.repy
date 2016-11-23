@@ -571,12 +571,10 @@ def generate_html_page():
     entriesStr = "".join(entries)
 
     # dynamic title showing Ip address, port and up time. 
-    title='Board [%f] @ %s:%d. Up time: %d' \
-        %( mycontext['election_priority'],
-           str(mycontext['ip']),
-           mycontext['port'],
-           int(getruntime()) )
+    leader_title = "Board"
     if mycontext['leader'] is not None:
+        if is_leader():
+            leader_title = "LEADER"
         leader = 'Current leader: %s:%d [%f]' \
             % (mycontext['leader']['ip'],
                mycontext['leader']['port'],
@@ -585,6 +583,13 @@ def generate_html_page():
         leader = 'Election in progress...'
     else:
         leader = 'No current leader'
+
+    title='%s [%f] @ %s:%d. Up time: %d' \
+        %( leader_title,
+           mycontext['election_priority'],
+           str(mycontext['ip']),
+           mycontext['port'],
+           int(getruntime()) )
     content = mycontext['boardcontents_template'] %( title, leader, entriesStr )
     fullpage_h = mycontext['frontpage_header_template'] + content
     fullpage = fullpage_h + mycontext['frontpage_footer_template'] % mycontext['authors']
