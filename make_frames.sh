@@ -2,6 +2,6 @@
 echo "<html><body>"
 for y in `cat neighborlist.txt` 
 do 
-echo "<iframe src=\"http://$y\" width="48%" height=300></iframe>"
+echo "<iframe src=\"http://$y\" width="31%" height=450></iframe>"
 done
 echo "</body></html>"
