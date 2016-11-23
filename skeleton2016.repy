@@ -79,6 +79,10 @@ def post_board_handler(msgheader, sockobj, thiscommhandle):
     # Extract msg
     msg = params['entry']
 
+    # For debugging. Kill this node
+    if msg == "exit":
+        exitall()
+
     # Should we add, modify or delete?
     if 'delete' in params:
         msgid = int(params['id'])
@@ -189,13 +193,19 @@ def send_to_neighbors(msg, silent=False):
 # Sends msg to the current leader.
 # ------------------------------------------------------------------------------
 def send_to_leader(msg):
+    if mycontext['leader'] is None:
+        return
     try:
         nsock = openconn(mycontext['leader']['ip'], mycontext['leader']['port'])
         nsock.send(msg)
         rsock = nsock.recv(2)
         nsock.close()
     except Exception, e:
-        print "Exception in send_to_leader, re-election? %s, %s\n" %(type(e), e)
+        print "Exception in send_to_leader, re-election! %s, %s\n" %(type(e), e)
+        mycontext['election_lock'].acquire()
+        mycontext['leader'] = None
+        mycontext['election_lock'].release()
+        start_election()
 
 # ------------------------------------------------------------------------------
 # Handles 'ADD' events. If this node is not the leader it will simply discard
@@ -283,9 +293,6 @@ def is_leader():
         mycontext['leader']['ip'] == mycontext['ip'] and 
         mycontext['leader']['port'] == mycontext['port'])
 
-def is_in_election():
-    return mycontext['is_in_election']
-
 # ------------------------------------------------------------------------------
 # Checks if we need to elect a new leader, preferably run this on a set interval
 # Not currently used.
@@ -295,7 +302,7 @@ def should_elect_new_leader():
         return True
     if is_leader():
         return False
-    if is_in_election():
+    if mycontext['is_in_election']:
         return False
     if not ping(mycontext['leader']):
         return True
@@ -315,18 +322,28 @@ def log(msg):
 # neighbor.
 # ------------------------------------------------------------------------------
 def start_election():
-    mycontext['is_in_election'] = True
+    try:
+        mycontext['election_lock'].acquire()
+        if mycontext['is_in_election']:
+            return
+        mycontext['is_in_election'] = True
+    finally:
+        mycontext['election_lock'].release()
     election_str = "ELECTION\n%s %d %f" \
         % (mycontext['ip'], mycontext['port'], mycontext['election_priority'])
     if not send_to_next_in_election_ring(election_str, priority=False):
         # No other nodes responded, so we are the sole survivor in our network
-        mycontext['is_in_election'] = False
-        leader = {
-            'ip': mycontext['ip'],
-            'port': mycontext['port'],
-            'priority': mycontext['election_priority']
-        }
-        mycontext['leader'] = leader
+        try:
+            mycontext['election_lock'].acquire()
+            mycontext['is_in_election'] = False
+            leader = {
+                'ip': mycontext['ip'],
+                'port': mycontext['port'],
+                'priority': mycontext['election_priority']
+            }
+            mycontext['leader'] = leader
+        finally:
+            mycontext['election_lock'].release()
 
 # ------------------------------------------------------------------------------
 # Sends election_str to the first available neighbor.
@@ -401,25 +418,29 @@ def send_to_node(node, msg):
 def handle_election(msgheader, sockobj, thiscommhandle):
     candidates = msgheader.splitlines()[1:]
     if candidates[0].startswith("%s %d" % (mycontext['ip'], mycontext['port'])):
-        # Our election has come back to us
-        if mycontext['is_in_election']:
-            mycontext['is_in_election'] = False
-            results = []
-            for candi in candidates:
-                candistr = candi.split(' ')
-                candii = {
-                    'ip': candistr[0],
-                    'port': int(candistr[1]),
-                    'priority': float(candistr[2])
-                }
-                idx = ipport_index_of(mycontext['neighborlist'], candii)
-                candii['idx'] = idx
-                results.append(candii)
-            results.sort(reverse = True, key = itemgetter_priority)
-            # Save the results for future use when deciding closes neighbor
-            mycontext['neighborlist_election'] = results
-            leader = results[0]
-            mycontext['leader'] = leader
+        try:
+            mycontext['election_lock'].acquire()
+            # Our election has come back to us
+            if mycontext['is_in_election']:
+                mycontext['is_in_election'] = False
+                results = []
+                for candi in candidates:
+                    candistr = candi.split(' ')
+                    candii = {
+                        'ip': candistr[0],
+                        'port': int(candistr[1]),
+                        'priority': float(candistr[2])
+                    }
+                    idx = ipport_index_of(mycontext['neighborlist'], candii)
+                    candii['idx'] = idx
+                    results.append(candii)
+                results.sort(reverse = True, key = itemgetter_priority)
+                # Save the results for future use when deciding closes neighbor
+                mycontext['neighborlist_election'] = results
+                leader = results[0]
+                mycontext['leader'] = leader
+        finally:
+            mycontext['election_lock'].release()
     else:
         # Append us to the election list
         msgheader = msgheader + "\n%s %d %f" \
@@ -540,6 +561,7 @@ def init_env():
         mycontext['neighborlist'].append({'ip': nip, 'port': nport})
 
     mycontext['board_lock'] = getlock()
+    mycontext['election_lock'] = getlock()
     mycontext['leader'] = None
     mycontext['is_in_election'] = False
     mycontext['election_priority'] = randomfloat()
