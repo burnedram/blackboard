@@ -210,9 +210,6 @@ def send_to_leader(msg):
         nsock.close()
     except Exception, e:
         print "Exception in send_to_leader, re-election! %s, %s\n" %(type(e), e)
-        mycontext['election_lock'].acquire()
-        mycontext['leader'] = None
-        mycontext['election_lock'].release()
         start_election()
 
 # ------------------------------------------------------------------------------
@@ -319,20 +316,32 @@ def is_leader():
         mycontext['leader']['ip'] == mycontext['ip'] and 
         mycontext['leader']['port'] == mycontext['port'])
 
+def get_next_heartbeat():
+    return int(round(randomfloat() * 10)) + 5
+
+def leader_heartbeat():
+    if should_elect_new_leader():
+        start_election()
+    settimer(get_next_heartbeat(), leader_heartbeat, [])
+
 # ------------------------------------------------------------------------------
 # Checks if we need to elect a new leader, preferably run this on a set interval
 # Not currently used.
 # ------------------------------------------------------------------------------
 def should_elect_new_leader():
-    if mycontext['leader'] is None:
-        return True
-    if is_leader():
+    try:
+        mycontext['election_lock'].acquire()
+        if mycontext['leader'] is None:
+            return True
+        if is_leader():
+            return False
+        if mycontext['is_in_election']:
+            return False
+        if not ping(mycontext['leader']):
+            return True
         return False
-    if mycontext['is_in_election']:
-        return False
-    if not ping(mycontext['leader']):
-        return True
-    return False
+    finally:
+        mycontext['election_lock'].release()
 
 def ping(node):
     try:
@@ -366,6 +375,7 @@ def start_election():
         mycontext['election_lock'].acquire()
         if mycontext['is_in_election']:
             return
+        mycontext['leader'] = None
         mycontext['is_in_election'] = True
     finally:
         mycontext['election_lock'].release()
@@ -665,10 +675,11 @@ if callfunc == 'initialize':
 
     start_board()
 
-    # We should always start an election when we first spawn
-    # but wait until all nodes are up
-    #settimer(10, start_election, [])
+    # We need to elect a leader
     start_election()
+
+    # Continuesly check if our leader is alive
+    settimer(get_next_heartbeat(), leader_heartbeat, [])
 
 # ----------------------------------------------------------------------------
 # urllib.repy
