@@ -110,31 +110,38 @@ def post_board_handler(msgheader, sockobj, thiscommhandle):
 # Send msg to all _other_ neighbors
 # ------------------------------------------------------------------------------
 def send_neighbors(msg):
-    socks = []
-    for neighbor in mycontext['neighborlist']:
-        while True:
+    unsent = mycontext['neighborlist'][:] # Local copy
+    while True:
+        still_unsent = []
+        socks = []
+        for neighbor in unsent:
             try:
                 nsock = openconn(neighbor['ip'], neighbor['port'])
                 nsock.send(msg)
                 socks.append({'ip': neighbor['ip'], 'port': neighbor['port'], 'sock': nsock})
             except Exception, e:
                 if str(e) == "Resource 'outsockets' limit exceeded!!":
+                    still_unsent.append(neighbor)
                     print str(e)
-                    print "Retrying in 1 second..."
-                    sleep(1)
-                    continue
                 else:
                     print "Exception in send_neighbors: %s, %s [%s:%d]\n" \
                         %(type(e), e, neighbor['ip'], neighbor['port'])
+        for neighbor in socks:
+            try:
+                nsock = neighbor['sock']
+                rsock = nsock.recv(2)
+            except Exception, e:
+                print "Exception in send_neighbors: %s, %s [%s:%d]\n" \
+                    %(type(e), e, neighbor['ip'], neighbor['port'])
+            finally:
+                try:
+                    nsock.close()
+                except Exception, e:
+                    pass
+        if not still_unsent:
             break
-    for neighbor in socks:
-        try:
-            nsock = neighbor['sock']
-            rsock = nsock.recv(2)
-            nsock.close()
-        except Exception, e:
-            print "Exception in send_neighbors: %s, %s [%s:%d]\n" \
-                %(type(e), e, neighbor['ip'], neighbor['port'])
+        unsent = still_unsent
+        sleep(1)
 
 # ------------------------------------------------------------------------------
 # Locks the board
