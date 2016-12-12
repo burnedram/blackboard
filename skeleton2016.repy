@@ -70,6 +70,12 @@ def post_board_handler(msgheader, sockobj, thiscommhandle):
     # Should we add, modify or delete?
     if 'delete' in params:
         msgid = int(params['id'])
+        if msgid not in mycontext['entries']:
+            htmlresponse = template % ("red", "Msgid % not found" % (msgid))
+            res = make_http_respons(404, "File not found", htmlresponse)
+            sockobj.send(res)
+            stopcomm(thiscommhandle)
+            return
         if params['delete'] == '1':
             nmsg = "DELETE\n%d" % (msgid)
             del mycontext['entries'][msgid]
@@ -86,16 +92,24 @@ def post_board_handler(msgheader, sockobj, thiscommhandle):
     sockobj.send(res)
     stopcomm(thiscommhandle)
 
+    
     # Notify all other blackboards about the change
+    conns = []
     for neighbor in mycontext['neighborlist']:
         try:
             nsock = openconn(neighbor['ip'], neighbor['port'])
             nsock.send(nmsg)
-            rsock = nsock.recv(2)
-            nsock.close()
+            conns.append(nsock)
         except Exception, e:
             print "Exception when syncing: %s, %s\n" %(type(e), e)
 
+    # Close all connections
+    for nsock in conns:
+        try:
+            nsock = nsock.recv(2)
+            nsock.close()
+        except Exception:
+            pass
 
 # ------------------------------------------------------------------------------
 # Handles syncing new entries between clients
