@@ -188,20 +188,24 @@ def is_entry_deleted(origin, msgid):
 
 # ------------------------------------------------------------------------------
 # Modifies an entry if it is "more recent"
+# Returns true if the action should be reposted
 # ------------------------------------------------------------------------------
 def try_modify_entry(origin, msgid, msgver, author, msg):
     if msgid not in mycontext['entries'][origin]:
         set_entry(origin, msgid, msgver, author, msg)
-        return
+        return True
     if is_entry_deleted(origin, msgid):
-        return
+        return False
 
     oldmsg = mycontext['entries'][origin][msgid]
     if msgver == oldmsg['msgver']:
         if oldmsg['author'] < author:
             set_entry(origin, msgid, msgver, author, msg)
+            return True
     elif msgver > oldmsg['msgver']:
         set_entry(origin, msgid, msgver, author, msg)
+        return True
+    return False
 
 # ------------------------------------------------------------------------------
 # Marks an entry as deleted, regardless if it exists or not
@@ -221,12 +225,18 @@ def resolve_add_board(msgheader, sockobj, thiscommhandle):
     sockobj.send('OK')
     stopcomm(thiscommhandle)
 
+    repost = False
     lock()
     try:
-        try_update_clock(msgid)
-        set_entry(origin, msgid, 0, origin, msg)
+        if msgid not in mycontext['entries'][origin]:
+            set_entry(origin, msgid, 0, origin, msg)
+            try_update_clock(msgid)
+            repost = True
     finally:
         unlock()
+
+    if repost:
+        send_neighbors(msgheader)
 
 # ------------------------------------------------------------------------------
 # Handles syncing changes to entries between clients
@@ -242,12 +252,17 @@ def resolve_modify_board(msgheader, sockobj, thiscommhandle):
     sockobj.send('OK')
     stopcomm(thiscommhandle)
 
+    repost = False
     lock()
     try:
-        try_update_clock(msgid)
-        try_modify_entry(origin, msgid, msgver, author, msg)
+        if try_modify_entry(origin, msgid, msgver, author, msg):
+            try_update_clock(msgid)
+            repost = True
     finally:
         unlock()
+
+    if repost:
+        send_neighbors(msgheader)
 
 # ------------------------------------------------------------------------------
 # Handles deleting entries between clients
@@ -260,12 +275,18 @@ def resolve_delete_board(msgheader, sockobj, thiscommhandle):
     sockobj.send('OK')
     stopcomm(thiscommhandle)
 
+    repost = False
     lock()
     try:
-        try_update_clock(msgid)
-        mark_entry_deleted(origin, msgid)
+        if msgid not in mycontext['entries'][origin] or not is_entry_deleted(origin, msgid):
+            mark_entry_deleted(origin, msgid)
+            try_update_clock(msgid)
+            repost = True
     finally:
         unlock()
+
+    if repost:
+        send_neighbors(msgheader)
 
 # ------------------------------------------------------------------------------
 # Handles other requests, outputs 404
