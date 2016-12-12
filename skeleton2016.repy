@@ -62,17 +62,19 @@ def post_board_handler(msgheader, sockobj, thiscommhandle):
         stopcomm(thiscommhandle)
         return
 
-    # No reason to keep the browser waiting
-    htmlresponse = template % ("green", "Request received")
-    res = make_http_response(202, 'Accepted', htmlresponse)
-    sockobj.send(res)
-    stopcomm(thiscommhandle)
+    if 'delete' in params or 'return_id' not in params:
+        # No reason to keep the browser waiting
+        htmlresponse = template % ("green", "Request received")
+        res = make_http_response(202, 'Accepted', htmlresponse)
+        sockobj.send(res)
+        stopcomm(thiscommhandle)
 
     # Extract msgid and msg
     msg = params['entry']
     msg_urlencoded = urllib_quote_plus(msg)
 
     # Should we add, modify or delete?
+    cmd = None
     lock()
     try:
         if 'delete' in params:
@@ -81,21 +83,28 @@ def post_board_handler(msgheader, sockobj, thiscommhandle):
             if not is_entry_deleted(origin, msgid):
                 if params['delete'] == '1':
                     mark_entry_deleted(origin, msgid)
-                    send_neighbors("DELETE\n%s\n%d" % (origin, msgid))
+                    cmd = "DELETE\n%s\n%d" % (origin, msgid)
                 else:
                     msgver = mycontext['entries'][origin][msgid]['msgver']
                     author = my_origin() 
                     set_entry(origin, msgid, msgver + 1, author, msg)
-                    send_neighbors("MODIFY\n%s\n%d\n%d\n%s\n%s" \
-                        % (origin, msgid, msgver + 1, author, msg))
+                    cmd = "MODIFY\n%s\n%d\n%d\n%s\n%s" \
+                        % (origin, msgid, msgver + 1, author, msg)
         else:
             origin = my_origin()
             msgid = get_and_increment_clock()
             set_entry(origin, msgid, 0, origin, msg)
-            send_neighbors("ADD\n%s\n%d\n%s" % (origin, msgid, msg))
+            cmd = "ADD\n%s\n%d\n%s" % (origin, msgid, msg)
+            if 'return_id' in params:
+                # For use with lab3postscript.sh
+                sockobj.send("%d@%s" % (msgid, origin))
+                stopcomm(thiscommhandle)
     finally:
         unlock()
 
+    # Reduce the amount of "deadlocking" by unlocking before starting network stuff
+    if cmd is not None:
+        send_neighbors(cmd)
 
 # ------------------------------------------------------------------------------
 # Send msg to all _other_ neighbors
@@ -103,13 +112,21 @@ def post_board_handler(msgheader, sockobj, thiscommhandle):
 def send_neighbors(msg):
     socks = []
     for neighbor in mycontext['neighborlist']:
-        try:
-            nsock = openconn(neighbor['ip'], neighbor['port'])
-            nsock.send(msg)
-            socks.append({'ip': neighbor['ip'], 'port': neighbor['port'], 'sock': nsock})
-        except Exception, e:
-            print "Exception in send_neighbors: %s, %s [%s:%d]\n" \
-                %(type(e), e, neighbor['ip'], neighbor['port'])
+        while True:
+            try:
+                nsock = openconn(neighbor['ip'], neighbor['port'])
+                nsock.send(msg)
+                socks.append({'ip': neighbor['ip'], 'port': neighbor['port'], 'sock': nsock})
+            except Exception, e:
+                if str(e) == "Resource 'outsockets' limit exceeded!!":
+                    print str(e)
+                    print "Retrying in 1 second..."
+                    sleep(1)
+                    continue
+                else:
+                    print "Exception in send_neighbors: %s, %s [%s:%d]\n" \
+                        %(type(e), e, neighbor['ip'], neighbor['port'])
+            break
     for neighbor in socks:
         try:
             nsock = neighbor['sock']
