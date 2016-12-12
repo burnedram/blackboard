@@ -26,11 +26,11 @@ def board_connection_handler(ip, port, sockobj, thiscommhandle, listencommhandle
         elif msgheader.startswith( 'POST' ):
             post_board_handler(msgheader, sockobj, thiscommhandle)
         elif msgheader.startswith( 'ADD' ):
-            add_board_handler(msgheader, sockobj, thiscommhandle)
+            resolve_add_board(msgheader, sockobj, thiscommhandle)
         elif msgheader.startswith( 'MODIFY' ):
-            modify_board_handler(msgheader, sockobj, thiscommhandle)
+            resolve_modify_board(msgheader, sockobj, thiscommhandle)
         elif msgheader.startswith( 'DELETE' ):
-            delete_board_handler(msgheader, sockobj, thiscommhandle)
+            resolve_delete_board(msgheader, sockobj, thiscommhandle)
         else:
             print '****Request:\n%s' % msgheader
             other_requests_handler(msgheader, sockobj, thiscommhandle)
@@ -62,72 +62,193 @@ def post_board_handler(msgheader, sockobj, thiscommhandle):
         stopcomm(thiscommhandle)
         return
 
+    # No reason to keep the browser waiting
+    htmlresponse = template % ("green", "Request received")
+    res = make_http_response(202, 'Accepted', htmlresponse)
+    sockobj.send(res)
+    stopcomm(thiscommhandle)
+
     # Extract msgid and msg
-    msgid = len(mycontext['entries']) + 1
     msg = params['entry']
     msg_urlencoded = urllib_quote_plus(msg)
 
     # Should we add, modify or delete?
-    if 'delete' in params:
-        msgid = int(params['id'])
-        if params['delete'] == '1':
-            nmsg = "DELETE\n%d" % (msgid)
-            del mycontext['entries'][msgid]
+    lock()
+    try:
+        if 'delete' in params:
+            msgid, origin = params['id'].split('@')
+            msgid = int(msgid)
+            if not is_entry_deleted(origin, msgid):
+                if params['delete'] == '1':
+                    mark_entry_deleted(origin, msgid)
+                    send_neighbors("DELETE\n%s\n%d" % (origin, msgid))
+                else:
+                    msgver = mycontext['entries'][origin][msgid]['msgver']
+                    author = my_origin() 
+                    set_entry(origin, msgid, msgver + 1, author, msg)
+                    send_neighbors("MODIFY\n%s\n%d\n%d\n%s\n%s" \
+                        % (origin, msgid, msgver + 1, author, msg))
         else:
-            nmsg = "MODIFY\n%d\n%s" % (msgid, msg_urlencoded)
-            mycontext['entries'][msgid] = msg
-    else:
-        nmsg = "ADD\n%d\n%s" % (msgid, msg_urlencoded)
-        mycontext['entries'][msgid] = msg
+            origin = my_origin()
+            msgid = get_and_increment_clock()
+            set_entry(origin, msgid, 0, origin, msg)
+            send_neighbors("ADD\n%s\n%d\n%s" % (origin, msgid, msg))
+    finally:
+        unlock()
 
-    # Don't keep the client waiting, so respond before we sync
-    htmlresponse = template % ("green", nmsg)
-    res = make_http_response(200, 'OK', htmlresponse)
-    sockobj.send(res)
-    stopcomm(thiscommhandle)
 
-    # Notify all other blackboards about the change
+# ------------------------------------------------------------------------------
+# Send msg to all _other_ neighbors
+# ------------------------------------------------------------------------------
+def send_neighbors(msg):
+    socks = []
     for neighbor in mycontext['neighborlist']:
         try:
             nsock = openconn(neighbor['ip'], neighbor['port'])
-            nsock.send(nmsg)
+            nsock.send(msg)
+            socks.append({'ip': neighbor['ip'], 'port': neighbor['port'], 'sock': nsock})
+        except Exception, e:
+            print "Exception in send_neighbors: %s, %s [%s:%d]\n" \
+                %(type(e), e, neighbor['ip'], neighbor['port'])
+    for neighbor in socks:
+        try:
+            nsock = neighbor['sock']
             rsock = nsock.recv(2)
             nsock.close()
         except Exception, e:
-            print "Exception when syncing: %s, %s\n" %(type(e), e)
+            print "Exception in send_neighbors: %s, %s [%s:%d]\n" \
+                %(type(e), e, neighbor['ip'], neighbor['port'])
 
+# ------------------------------------------------------------------------------
+# Locks the board
+# ------------------------------------------------------------------------------
+def lock():
+    mycontext['lock'].acquire()
+
+# ------------------------------------------------------------------------------
+# Unlocks the board
+# ------------------------------------------------------------------------------
+def unlock():
+    mycontext['lock'].release()
+
+# ------------------------------------------------------------------------------
+# Returns this nodes ip and port as a string
+# ------------------------------------------------------------------------------
+def my_origin():
+    return "%s:%d" % (mycontext['ip'], mycontext['port'])
+
+# ------------------------------------------------------------------------------
+# Increments the logic clock, and returns the previous value
+# ------------------------------------------------------------------------------
+def get_and_increment_clock():
+    clock = mycontext['logic_clock']
+    mycontext['logic_clock'] = clock + 1
+    return clock
+
+# ------------------------------------------------------------------------------
+# Updates the clock if newclock is larger
+# ------------------------------------------------------------------------------
+def try_update_clock(newclock):
+    if mycontext['logic_clock'] <= newclock:
+        mycontext['logic_clock'] = newclock + 1
+
+# ------------------------------------------------------------------------------
+# Updates an entry on the local board
+# ------------------------------------------------------------------------------
+def set_entry(origin, msgid, msgver, author, msg):
+    mycontext['entries'][origin][msgid] = {
+        'msgver': msgver,
+        'author': author,
+        'msg': msg,
+        'deleted': False
+    }
+
+# ------------------------------------------------------------------------------
+# Checks if an entry is marked as deleted 
+# ------------------------------------------------------------------------------
+def is_entry_deleted(origin, msgid):
+    return mycontext['entries'][origin][msgid]['deleted']
+
+# ------------------------------------------------------------------------------
+# Modifies an entry if it is "more recent"
+# ------------------------------------------------------------------------------
+def try_modify_entry(origin, msgid, msgver, author, msg):
+    if msgid not in mycontext['entries'][origin]:
+        set_entry(origin, msgid, msgver, author, msg)
+        return
+    if is_entry_deleted(origin, msgid):
+        return
+
+    oldmsg = mycontext['entries'][origin][msgid]
+    if msgver == oldmsg['msgver']:
+        if oldmsg['author'] < author:
+            set_entry(origin, msgid, msgver, author, msg)
+    elif msgver > oldmsg['msgver']:
+        set_entry(origin, msgid, msgver, author, msg)
+
+# ------------------------------------------------------------------------------
+# Marks an entry as deleted, regardless if it exists or not
+# ------------------------------------------------------------------------------
+def mark_entry_deleted(origin, msgid):
+    mycontext['entries'][origin][msgid] = {'deleted': True}
 
 # ------------------------------------------------------------------------------
 # Handles syncing new entries between clients
 # ------------------------------------------------------------------------------
-def add_board_handler(msgheader, sockobj, thiscommhandle):
+def resolve_add_board(msgheader, sockobj, thiscommhandle):
     lines = msgheader.splitlines()
-    msgid = int(lines[1])
-    msg = urllib_unquote_plus(lines[2])
-    mycontext['entries'][msgid] = msg
+    origin = lines[1]
+    msgid = int(lines[2])
+    msg = lines[3]
+    
     sockobj.send('OK')
     stopcomm(thiscommhandle)
+
+    lock()
+    try:
+        try_update_clock(msgid)
+        set_entry(origin, msgid, 0, origin, msg)
+    finally:
+        unlock()
 
 # ------------------------------------------------------------------------------
 # Handles syncing changes to entries between clients
 # ------------------------------------------------------------------------------
-def modify_board_handler(msgheader, sockobj, thiscommhandle):
+def resolve_modify_board(msgheader, sockobj, thiscommhandle):
     lines = msgheader.splitlines()
-    msgid = int(lines[1])
-    msg = urllib_unquote_plus(lines[2])
-    mycontext['entries'][msgid] = msg
+    origin = lines[1]
+    msgid = int(lines[2])
+    msgver = int(lines[3])
+    author = lines[4]
+    msg = lines[5]
+
     sockobj.send('OK')
     stopcomm(thiscommhandle)
+
+    lock()
+    try:
+        try_update_clock(msgid)
+        try_modify_entry(origin, msgid, msgver, author, msg)
+    finally:
+        unlock()
 
 # ------------------------------------------------------------------------------
 # Handles deleting entries between clients
 # ------------------------------------------------------------------------------
-def delete_board_handler(msgheader, sockobj, thiscommhandle):
+def resolve_delete_board(msgheader, sockobj, thiscommhandle):
     lines = msgheader.splitlines()
-    msgid = int(lines[1])
-    del mycontext['entries'][msgid]
+    origin = lines[1]
+    msgid = int(lines[2])
+
     sockobj.send('OK')
     stopcomm(thiscommhandle)
+
+    lock()
+    try:
+        try_update_clock(msgid)
+        mark_entry_deleted(origin, msgid)
+    finally:
+        unlock()
 
 # ------------------------------------------------------------------------------
 # Handles other requests, outputs 404
@@ -188,9 +309,14 @@ def generate_html_page():
     #Initialize blackboard content
     
     entries = []
-    for msgid in mycontext['entries']:
-        msg = mycontext['entries'][msgid]
-        entries.append(mycontext['entry_template'] %('entries/%d' % (msgid), msgid, msg))
+    for msgid in range(mycontext['logic_clock'] + 1):
+        for origin in mycontext['entries']:
+            if msgid not in mycontext['entries'][origin] or is_entry_deleted(origin, msgid):
+                continue
+            msg = mycontext['entries'][origin][msgid]
+            boardid = "%d@%s" % (msgid, origin)
+            entries.append(mycontext['entry_template'] \
+                %('entries/%s' % (boardid), boardid, msg['msg']))
     entriesStr = "".join(entries)
 
     # dynamic title showing Ip address, port and up time. 
@@ -223,7 +349,6 @@ if callfunc == 'initialize':
     else:
         raise Exception("Usage: python <path to repy.py> <path to restrictions.default> skeleton2016.repy <port> [ip (optional)]")
 
-    mycontext['entries'] = {}
 
     #Initialize Port and IP
     mycontext['port'] = port
@@ -235,6 +360,8 @@ if callfunc == 'initialize':
     mycontext['frontpage_header_template'] = file("board_frontpage_header_template.html").read()
     mycontext['frontpage_footer_template'] = file("board_frontpage_footer_template.html").read()
  
+    mycontext['entries'] = {"%s:%d" % (ip, port): {}}
+
     # Read neighbors
     mycontext['neighborlist'] = []
     for neighbor in file("neighborlist.txt").read().splitlines():
@@ -243,6 +370,13 @@ if callfunc == 'initialize':
         nport = int(ipport[1])
         if nip != ip or nport != port:
             mycontext['neighborlist'].append({'ip': nip, 'port': nport})
+            # Create a "subboard" for each neighbor
+            mycontext['entries']["%s:%d" % (nip, nport)] = {}
+    mycontext['neighborlist'].sort()
+
+    # Create local board lock and logic clock
+    mycontext['lock'] = getlock()
+    mycontext['logic_clock'] = 0
 
     mycontext['authors'] = "Rafael Mohlin (mrafael@student.chalmers.se)"
 
