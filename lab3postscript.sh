@@ -1,6 +1,7 @@
 #!/bin/bash
 add_entry() {
-    entryid=$(curl -d "entry=$2&return_id=1" -X 'POST' "http://$1/entries" 2>/dev/null)
+    entryid=($(curl -d "entry=$2&return_id=1" -X 'POST' "http://$1/entries" 2>/dev/null))
+    entryid=${entryid[0]}
     (
         flock -x 200
         if [ ! -z "$3" ]; then
@@ -38,7 +39,7 @@ while [ $FLOOD -lt $FLOOD_ENTRIES ]; do
         . /dev/shm/ENTRIES
         entryid=${ENTRIES[$RANDOM % ${#ENTRIES[@]}]}
         post=""
-        rnd=$((RANDOM % 6))
+        rnd=$((RANDOM % 5))
         if [ $rnd -lt 2 ]; then
             printf "+"
             add_entry "$ipport" "f$((START + FLOOD))" &
@@ -46,14 +47,14 @@ while [ $FLOOD -lt $FLOOD_ENTRIES ]; do
             if [ $rnd -lt 4 ] ; then
                 printf "/"
                 post="entry=m${#ENTRIES[@]}&id=$entryid&delete=0"
-            elif [ $rnd -eq 5 ]; then
+            elif [ $rnd -eq 4 ]; then
                 printf "-"
                 post="entry=d${#ENTRIES[@]}&id=$entryid&delete=1"
             fi
             curl -d "$post" -X 'POST' "http://${ipport}/entries" 2>/dev/null 1>&2 &
         fi
         ((FLOOD++))
-        sleep .5
+        #sleep .5
     done <neighborlist.txt
 done
 printf "\n"
