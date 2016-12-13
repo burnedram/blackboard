@@ -10,11 +10,22 @@ SEGMENT RIGHT
     128.238.63.32:63145
 END
 
+# *      *
+# |\    /|
+# *-*--*-*
+# |/    \|
+# *      *
 TOPOLOGY CONNECTED
-    LEFT 130.194.252.9:63145
-    RIGHT 157.92.44.101:63145
+    LEFT
+    RIGHT
+    216.48.80.14:63145 130.194.252.9:63145
 END
 
+# *      *
+# |\    /|
+# *-*  *-*
+# |/    \|
+# *      *
 TOPOLOGY DISCONNECTED
     LEFT
     RIGHT
