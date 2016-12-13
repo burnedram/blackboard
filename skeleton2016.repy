@@ -31,6 +31,8 @@ def board_connection_handler(ip, port, sockobj, thiscommhandle, listencommhandle
             resolve_modify_board(msgheader, sockobj, thiscommhandle)
         elif msgheader.startswith( 'DELETE' ):
             resolve_delete_board(msgheader, sockobj, thiscommhandle)
+        elif msgheader.startswith( 'REJOIN' ):
+            rejoin_network_handler(msgheader, sockobj, thiscommhandle)
         else:
             print '****Request:\n%s' % msgheader
             other_requests_handler(msgheader, sockobj, thiscommhandle)
@@ -49,12 +51,123 @@ def get_board_handler(msgheader, sockobj, thiscommhandle):
     stopcomm(thiscommhandle) 
 
 # ------------------------------------------------------------------------------
+# Handles rejoin requests from other nodes that has reconnected to this node
+# Here we compare their current boardstate and resends the parts that they are
+# missing. We assume that this node has also realised that it has regained
+# communication with the sending node, so we edit our board, even though it
+# may differ from the other node's
+# ------------------------------------------------------------------------------
+def rejoin_network_handler(msgheader, sockobj, thiscommhandle):
+    lines = msgheader.splitlines()
+    sender = lines[1]
+
+    sockobj.send("OK")
+    stopcomm(thiscommhandle)
+
+    lock()
+    try:
+        # Create deep copy of our boardstate
+        board = {}
+        for origin in mycontext['entries']:
+            board[origin] = {}
+            for msgid in mycontext['entries'][origin]:
+                board[origin][msgid] = {}
+                for key in mycontext['entries'][origin][msgid]:
+                    board[origin][msgid][key] = mycontext['entries'][origin][msgid][key]
+
+        # Find out what we should notify them about
+        for line in lines[2:]:
+            if line.startswith("DELETED "):
+                line = line.split()[1]
+                msgid, origin, = line.split("@")
+                msgid = int(msgid)
+                if origin in board and msgid in board[origin]:
+                    del board[origin][msgid]
+                continue
+            msgid, origin, msgver, author = line.split("@")
+            msgid = int(msgid)
+            msgver = int(msgver)
+            if origin in board and msgid in board[origin]:
+                if board[origin][msgid]['deleted']:
+                    continue
+                elif board[origin][msgid]['msgver'] == msgver:
+                    if author > board[origin][msgid]['author']:
+                        del board[origin][msgid]
+                elif board[origin][msgid]['msgver'] < msgver:
+                    del board[origin][msgid]
+    finally:
+        unlock()
+
+    # Notify the sender
+    ssplit = sender.split(":")
+    ipport = {'ip': ssplit[0], 'port': int(ssplit[1])}
+    for origin in board:
+        for msgid in board[origin]:
+            entry = board[origin][msgid]
+            if entry['deleted']:
+                msg = "DELETE\n%s\n%d" % (origin, msgid)
+            else:
+                msg = "MODIFY\n%s\n%d\n%d\n%s\n%s" \
+                    % (origin, msgid, entry['msgver'], entry['author'], entry['msg'])
+            send_to([ ipport ], msg)
+
+# ------------------------------------------------------------------------------
+# topology must be valid.
+# Sets a new topology, and issues a request to all reconnected nodes for
+# any information we might not have.
+# ------------------------------------------------------------------------------
+def set_topology(topName):
+    oldTop = mycontext['neighborlist']
+    newTop = mycontext['topologies'][topName]
+    mycontext['neighborlist'] = newTop
+    mycontext['topology'] = topName
+    print "New topology: %s" % topName
+    rejoin = []
+    for ipport in newTop:
+        if ipport not in oldTop:
+            rejoin.append(ipport)
+    if rejoin:
+        snapshot = [ "REJOIN", my_origin() ]
+        for origin in mycontext['entries']:
+            for msgid in mycontext['entries'][origin]:
+                if is_entry_deleted(origin, msgid):
+                    msg = "DELETED %d@%s" % (msgid, origin)
+                else:
+                    msgver = mycontext['entries'][origin][msgid]['msgver']
+                    author = mycontext['entries'][origin][msgid]['author']
+                    msg = "%d@%s@%d@%s" % \
+                        (msgid, origin, msgver, author)
+                snapshot.append(msg)
+        send_to(rejoin, "\n".join(snapshot))
+
+# ------------------------------------------------------------------------------
 # Handles entry POSTing requests to the blackboard.
 # ------------------------------------------------------------------------------
 def post_board_handler(msgheader, sockobj, thiscommhandle):
     template = '<html><head><style>.status {color: %s;font-size: 75%%;}</style></head><body><pre><samp class="status">%s</samp></pre></body><html>'
     query = extract_http_request_contents(msgheader)
     params = extract_parameters_from_query(query)
+
+    # I am sorry RESTful gods
+    if 'set_topology' in params:
+        topName = params['set_topology']
+        if topName not in mycontext['topologies']:
+            htmlresponse = template % ("red", "No such topology")
+            res = make_http_response(404, 'File not found', htmlresponse)
+            sockobj.send(res)
+            stopcomm(thiscommhandle)
+        else:
+            htmlresponse = template % ("green", "Nice meme")
+            res = make_http_response(200, 'Ok', htmlresponse)
+            sockobj.send(res)
+            stopcomm(thiscommhandle)
+            lock()
+            try:
+                set_topology(topName)
+            finally:
+                unlock()
+        return
+
     if 'entry' not in params:
         htmlresponse = template % ("red", "No entry in POST")
         res = make_http_response(400, 'Bad Request', htmlresponse)
@@ -110,7 +223,13 @@ def post_board_handler(msgheader, sockobj, thiscommhandle):
 # Send msg to all _other_ neighbors
 # ------------------------------------------------------------------------------
 def send_neighbors(msg):
-    unsent = mycontext['neighborlist'][:] # Local copy
+    send_to(mycontext['neighborlist'], msg)
+
+# ------------------------------------------------------------------------------
+# Send msg to nodes
+# ------------------------------------------------------------------------------
+def send_to(nodes, msg):
+    unsent = nodes[:] # Local copy
     while True:
         still_unsent = []
         socks = []
@@ -126,14 +245,14 @@ def send_neighbors(msg):
                     still_unsent.append(neighbor)
                     print str(e)
                 else:
-                    print "Exception in send_neighbors: %s, %s [%s:%d]\n" \
+                    print "Exception in send_to: %s, %s [%s:%d]\n" \
                         %(type(e), e, neighbor['ip'], neighbor['port'])
         for neighbor in socks:
             try:
                 nsock = neighbor['sock']
                 rsock = nsock.recv(2)
             except Exception, e:
-                print "Exception in send_neighbors: %s, %s [%s:%d]\n" \
+                print "Exception in send_to: %s, %s [%s:%d]\n" \
                     %(type(e), e, neighbor['ip'], neighbor['port'])
             finally:
                 try:
@@ -366,9 +485,10 @@ def generate_html_page():
                 %('entries/%s' % (boardid), boardid, msg['msg']))
     entriesStr = "".join(entries)
 
-    # dynamic title showing Ip address, port and up time. 
-    title='Sample board @ %s:%d. Up time: %d' %( str(mycontext['ip']), mycontext['port'], int(getruntime()) )
-    content = mycontext['boardcontents_template'] %( title, entriesStr )
+    # dynamic title showing Ip address, port, up time and current topology. 
+    title='Segmented network @ %s:%d. Up time: %d' %( str(mycontext['ip']), mycontext['port'], int(getruntime()) )
+    topName = "Topology: %s" % mycontext['topology']
+    content = mycontext['boardcontents_template'] %( title, topName, entriesStr )
     fullpage_h = mycontext['frontpage_header_template'] + content
     fullpage = fullpage_h + mycontext['frontpage_footer_template'] % mycontext['authors']
     #print entriesStr, content, fullpage
@@ -429,7 +549,7 @@ if callfunc == 'initialize':
     lines = []
     for iLine in range(len(rawlines)):
         line = rawlines[iLine].strip()
-        if line:
+        if line and line[0] != "#":
             lines.append(line)
 
     myipport = {'ip': ip, 'port': port}
@@ -472,6 +592,7 @@ if callfunc == 'initialize':
             topName = lines[iLine].split()[1]
             mycontext['neighborlist'] = topologies[topName]
             mycontext['topology'] = topName
+            print "Default topology: %s" % topName
         else:
             print "TOPOLOGY PARSER: Unknown string: %s" % lines[iLine]
         iLine += 1
@@ -481,10 +602,7 @@ if callfunc == 'initialize':
         print "Topology: %s" % top
         for origin in mycontext['topologies'][top]:
             print "  %s:%d" % (origin['ip'], origin['port'])
-
-    print "Current topology: %s" % mycontext['topology']
-    for origin in mycontext['neighborlist']:
-        print "  %s:%d" % (origin['ip'], origin['port'])
+        print ""
 
     # Create local board lock and logic clock
     mycontext['lock'] = getlock()
