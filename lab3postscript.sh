@@ -1,8 +1,4 @@
 #!/bin/bash
-make_neighborlist() {
-    grep -P '^\s*\d+\.\d+\.\d+\.\d+:\d+\s*$' topologies.txt | sed 's/^ *//;s/ *$//' | sort | uniq -u
-}
-
 add_entry() {
     entryid=($(curl -d "entry=$2&return_id=1" -X 'POST' "http://$1/entries" 2>/dev/null))
     entryid=${entryid[0]}
@@ -26,7 +22,7 @@ LOCK=$(mktemp)
 START=0
 printf "Adding $START_ENTRIES entries"
 while [ $START -lt $START_ENTRIES ]; do
-    for ipport in $(make_neighborlist); do
+    for ipport in $(./get_neighborlist.sh); do
         if [ $START -ge $START_ENTRIES ]; then
             break
         fi
@@ -42,7 +38,7 @@ read user
 printf "Posting $FLOOD_ENTRIES requests"
 FLOOD=0
 while [ $FLOOD -lt $FLOOD_ENTRIES ]; do
-    for ipport in $(make_neighborlist); do
+    for ipport in $(./get_neighborlist.sh); do
         if [ $FLOOD -ge $FLOOD_ENTRIES ]; then
             break
         fi
