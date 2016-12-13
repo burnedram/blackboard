@@ -120,7 +120,9 @@ def send_neighbors(msg):
                 nsock.send(msg)
                 socks.append({'ip': neighbor['ip'], 'port': neighbor['port'], 'sock': nsock})
             except Exception, e:
-                if str(e) == "Resource 'outsockets' limit exceeded!!":
+                if str(e) == "Resource 'outsockets' limit exceeded!!" or \
+                        str(e) == "Connection timed out!" or \
+                        str(e) == "timed out":
                     still_unsent.append(neighbor)
                     print str(e)
                 else:
