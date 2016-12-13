@@ -374,6 +374,19 @@ def generate_html_page():
     #print entriesStr, content, fullpage
     return fullpage
     
+
+# ----------------------------------------------------------------------------
+# Used by initialize func when parsing topology.
+# Responsible for populating mycontext['entries'] with subboards.
+# ----------------------------------------------------------------------------
+def parse_ipport_str(ipport, ignoreself=True):
+    mycontext['entries'][ipport] = {}
+    ipport = ipport.split(':')
+    nip = ipport[0]
+    nport = int(ipport[1])
+    ipport = {'ip': nip, 'port': nport}
+    return ipport
+
 # ------------------------------------------------------------------------------             
 # Main entry point of the program. Initalizes global variables in mycontext
 # and calls start_board() which opens a socket for incoming connections.
@@ -411,15 +424,67 @@ if callfunc == 'initialize':
 
     # Read neighbors
     mycontext['neighborlist'] = []
-    for neighbor in file("neighborlist.txt").read().splitlines():
-        ipport = neighbor.split(':')
-        nip = ipport[0]
-        nport = int(ipport[1])
-        if nip != ip or nport != port:
-            mycontext['neighborlist'].append({'ip': nip, 'port': nport})
-            # Create a "subboard" for each neighbor
-            mycontext['entries']["%s:%d" % (nip, nport)] = {}
-    mycontext['neighborlist'].sort()
+
+    rawlines = file("topologies.txt").read().splitlines()
+    lines = []
+    for iLine in range(len(rawlines)):
+        line = rawlines[iLine].strip()
+        if line:
+            lines.append(line)
+
+    myipport = {'ip': ip, 'port': port}
+    iLine = 0
+    segments = {}
+    topologies = {}
+    while iLine < len(lines):
+        # SEGMENTs should be defined at the beginning of the file
+        if lines[iLine].startswith("SEGMENT "):
+            segName = lines[iLine].split()[1]
+            segments[segName] = []
+            iLine += 1
+            while lines[iLine] != "END":
+                segments[segName].append(parse_ipport_str(lines[iLine]))
+                iLine += 1
+        # TOPOLOGYs should be defined at the end of the file
+        # If it is not some segments might not have been parsed when the topology is created
+        elif lines[iLine].startswith("TOPOLOGY "):
+            topName = lines[iLine].split()[1]
+            topologies[topName] = []
+            iLine += 1
+            while lines[iLine] != "END":
+                top = []
+                for segip in lines[iLine].split():
+                    if segip in segments:
+                        # Expand segment
+                        top += segments[segip]
+                    else:
+                        # Should be an ip, or the file is borked
+                        top.append(parse_ipport_str(segip))
+                iLine += 1
+                if myipport in top:
+                    # We are a part of this topology
+                    top.remove(myipport)
+                    for ipport in top:
+                        if ipport not in topologies[topName]:
+                            topologies[topName].append(ipport)
+        # DEFAULT must come after the referenced topology
+        elif lines[iLine].startswith("DEFAULT "):
+            topName = lines[iLine].split()[1]
+            mycontext['neighborlist'] = topologies[topName]
+            mycontext['topology'] = topName
+        else:
+            print "TOPOLOGY PARSER: Unknown string: %s" % lines[iLine]
+        iLine += 1
+    mycontext['topologies'] = topologies
+
+    for top in mycontext['topologies']:
+        print "Topology: %s" % top
+        for origin in mycontext['topologies'][top]:
+            print "  %s:%d" % (origin['ip'], origin['port'])
+
+    print "Current topology: %s" % mycontext['topology']
+    for origin in mycontext['neighborlist']:
+        print "  %s:%d" % (origin['ip'], origin['port'])
 
     # Create local board lock and logic clock
     mycontext['lock'] = getlock()
