@@ -117,27 +117,33 @@ def rejoin_network_handler(msgheader, sockobj, thiscommhandle):
 # any information we might not have.
 # ------------------------------------------------------------------------------
 def set_topology(topName):
-    oldTop = mycontext['neighborlist']
-    newTop = mycontext['topologies'][topName]
-    mycontext['neighborlist'] = newTop
-    mycontext['topology'] = topName
-    print "New topology: %s" % topName
+    snapshot = []
     rejoin = []
-    for ipport in newTop:
-        if ipport not in oldTop:
-            rejoin.append(ipport)
-    if rejoin:
-        snapshot = [ "REJOIN", my_origin() ]
-        for origin in mycontext['entries']:
-            for msgid in mycontext['entries'][origin]:
-                if is_entry_deleted(origin, msgid):
-                    msg = "DELETED %d@%s" % (msgid, origin)
-                else:
-                    msgver = mycontext['entries'][origin][msgid]['msgver']
-                    author = mycontext['entries'][origin][msgid]['author']
-                    msg = "%d@%s@%d@%s" % \
-                        (msgid, origin, msgver, author)
-                snapshot.append(msg)
+    lock()
+    try:
+        oldTop = mycontext['neighborlist']
+        newTop = mycontext['topologies'][topName]
+        mycontext['neighborlist'] = newTop
+        mycontext['topology'] = topName
+        print "New topology: %s" % topName
+        for ipport in newTop:
+            if ipport not in oldTop:
+                rejoin.append(ipport)
+        if rejoin:
+            snapshot = [ "REJOIN", my_origin() ]
+            for origin in mycontext['entries']:
+                for msgid in mycontext['entries'][origin]:
+                    if is_entry_deleted(origin, msgid):
+                        msg = "DELETED %d@%s" % (msgid, origin)
+                    else:
+                        msgver = mycontext['entries'][origin][msgid]['msgver']
+                        author = mycontext['entries'][origin][msgid]['author']
+                        msg = "%d@%s@%d@%s" % \
+                            (msgid, origin, msgver, author)
+                    snapshot.append(msg)
+    finally:
+        unlock()
+    if snapshot:
         send_to(rejoin, "\n".join(snapshot))
 
 # ------------------------------------------------------------------------------
@@ -161,11 +167,7 @@ def post_board_handler(msgheader, sockobj, thiscommhandle):
             res = make_http_response(200, 'Ok', htmlresponse)
             sockobj.send(res)
             stopcomm(thiscommhandle)
-            lock()
-            try:
-                set_topology(topName)
-            finally:
-                unlock()
+            set_topology(topName)
         return
 
     if 'entry' not in params:
@@ -212,6 +214,11 @@ def post_board_handler(msgheader, sockobj, thiscommhandle):
                 # For use with lab3postscript.sh
                 sockobj.send("%d@%s" % (msgid, origin))
                 stopcomm(thiscommhandle)
+            nentries = count_entries()
+            if nentries == 1:
+                mycontext['post_begin'] = getruntime()
+            elif nentries == 1000:
+                mycontext['post_end'] = getruntime()
     finally:
         unlock()
 
@@ -229,40 +236,71 @@ def send_neighbors(msg):
 # Send msg to nodes
 # ------------------------------------------------------------------------------
 def send_to(nodes, msg):
-    unsent = nodes[:] # Local copy
+    unsent = []
+    for neighbor in nodes:
+        unsent.append({'ip': neighbor['ip'], 'port': neighbor['port'], 'msg': msg})
+    mycontext['send_lock'].acquire()
+    try:
+        has_captian = mycontext['send_thread']
+        mycontext['send_thread'] = True
+        mycontext['send_queue'] += unsent
+    finally:
+        mycontext['send_lock'].release()
+    if not has_captian:
+        thread_send_to()
+
+def thread_send_to():
+    max_socks = mycontext['outsockets'] + 5
+    unsent = []
     while True:
-        still_unsent = []
-        socks = []
-        for neighbor in unsent:
-            try:
-                nsock = openconn(neighbor['ip'], neighbor['port'])
-                nsock.send(msg)
-                socks.append({'ip': neighbor['ip'], 'port': neighbor['port'], 'sock': nsock})
-            except Exception, e:
-                if str(e) == "Resource 'outsockets' limit exceeded!!" or \
-                        str(e) == "Connection timed out!" or \
-                        str(e) == "timed out":
-                    still_unsent.append(neighbor)
-                    print str(e)
-                else:
-                    print "Exception in send_to: %s, %s [%s:%d]\n" \
-                        %(type(e), e, neighbor['ip'], neighbor['port'])
-        for neighbor in socks:
-            try:
-                nsock = neighbor['sock']
-                rsock = nsock.recv(2)
-            except Exception, e:
-                print "Exception in send_to: %s, %s [%s:%d]\n" \
+        mycontext['send_lock'].acquire()
+        try:
+            if unsent:
+                mycontext['send_queue'] = unsent + mycontext['send_queue']
+            unsent = mycontext['send_queue'][:max_socks]
+            if not unsent:
+                mycontext['send_thread'] = False
+                return
+            mycontext['send_queue'] = mycontext['send_queue'][len(unsent):]
+        finally:
+            mycontext['send_lock'].release()
+        unsent = send_to_guarded(unsent)
+        max_socks = mycontext['outsockets']
+
+def send_to_guarded(unsent):
+    still_unsent = []
+    socks = []
+    for neighbor in unsent:
+        try:
+            nsock = openconn(neighbor['ip'], neighbor['port'])
+            nsock.send(neighbor['msg'])
+            socks.append({'ip': neighbor['ip'], 'port': neighbor['port'], 'sock': nsock})
+        except Exception, e:
+            if str(e) == "Resource 'outsockets' limit exceeded!!":
+                still_unsent.append(neighbor)
+                if mycontext['outsockets'] != len(socks):
+                    mycontext['outsockets'] = len(socks)
+                    print "Outsockets limit: %d" % len(socks)
+            elif str(e) == "Connection timed out!" or \
+                    str(e) == "timed out":
+                still_unsent.append(neighbor)
+                print str(e)
+            else:
+                print "Exception in send_to_guarded/1: %s, %s [%s:%d]\n" \
                     %(type(e), e, neighbor['ip'], neighbor['port'])
-            finally:
-                try:
-                    nsock.close()
-                except Exception, e:
-                    pass
-        if not still_unsent:
-            break
-        unsent = still_unsent
-        sleep(1)
+    for neighbor in socks:
+        try:
+            nsock = neighbor['sock']
+            rsock = nsock.recv(2)
+        except Exception, e:
+            print "Exception in send_to_guarded/2: %s, %s [%s:%d]\n" \
+                %(type(e), e, neighbor['ip'], neighbor['port'])
+        finally:
+            try:
+                nsock.close()
+            except Exception, e:
+                pass
+    return still_unsent
 
 # ------------------------------------------------------------------------------
 # Locks the board
@@ -341,6 +379,12 @@ def try_modify_entry(origin, msgid, msgver, author, msg):
 def mark_entry_deleted(origin, msgid):
     mycontext['entries'][origin][msgid] = {'deleted': True}
 
+def count_entries():
+    count = 0
+    for origin in mycontext['entries']:
+        count += len(mycontext['entries'][origin])
+    return count
+
 # ------------------------------------------------------------------------------
 # Handles syncing new entries between clients
 # ------------------------------------------------------------------------------
@@ -360,11 +404,16 @@ def resolve_add_board(msgheader, sockobj, thiscommhandle):
             set_entry(origin, msgid, 0, origin, msg)
             try_update_clock(msgid)
             repost = True
+            nentries = count_entries()
+            if nentries == 1:
+                mycontext['post_begin'] = getruntime()
+            elif nentries == 1000:
+                mycontext['post_end'] = getruntime()
     finally:
         unlock()
 
-    if repost:
-        send_neighbors(msgheader)
+    #if repost:
+        #send_neighbors(msgheader)
 
 # ------------------------------------------------------------------------------
 # Handles syncing changes to entries between clients
@@ -389,8 +438,8 @@ def resolve_modify_board(msgheader, sockobj, thiscommhandle):
     finally:
         unlock()
 
-    if repost:
-        send_neighbors(msgheader)
+    #if repost:
+        #send_neighbors(msgheader)
 
 # ------------------------------------------------------------------------------
 # Handles deleting entries between clients
@@ -413,8 +462,8 @@ def resolve_delete_board(msgheader, sockobj, thiscommhandle):
     finally:
         unlock()
 
-    if repost:
-        send_neighbors(msgheader)
+    #if repost:
+        #send_neighbors(msgheader)
 
 # ------------------------------------------------------------------------------
 # Handles other requests, outputs 404
@@ -475,19 +524,29 @@ def generate_html_page():
     #Initialize blackboard content
     
     entries = []
-    for msgid in range(mycontext['logic_clock'] + 1):
-        for origin in mycontext['entries']:
-            if msgid not in mycontext['entries'][origin] or is_entry_deleted(origin, msgid):
-                continue
-            msg = mycontext['entries'][origin][msgid]
-            boardid = "%d@%s" % (msgid, origin)
-            entries.append(mycontext['entry_template'] \
-                %('entries/%s' % (boardid), boardid, msg['msg']))
+    #for msgid in range(mycontext['logic_clock'] + 1):
+    #    for origin in mycontext['entries']:
+    #        if msgid not in mycontext['entries'][origin] or is_entry_deleted(origin, msgid):
+    #            continue
+    #        msg = mycontext['entries'][origin][msgid]
+    #        boardid = "%d@%s" % (msgid, origin)
+    #        entries.append(mycontext['entry_template'] \
+    #            %('entries/%s' % (boardid), boardid, msg['msg']))
     entriesStr = "".join(entries)
 
     # dynamic title showing Ip address, port, up time and current topology. 
-    title='Segmented network @ %s:%d. Up time: %d' %( str(mycontext['ip']), mycontext['port'], int(getruntime()) )
-    topName = "Topology: %s" % mycontext['topology']
+    title='Segmented network @ %s:%d. Up time: %ds' %( str(mycontext['ip']), mycontext['port'], int(getruntime()) )
+    nentries = count_entries()
+    if nentries >= 1000:
+        consistent = "%ds" % (mycontext['post_end'] - mycontext['post_begin'])
+    else:
+        consistent = "Not consistent"
+    sendqueue = len(mycontext['send_queue'])
+    if sendqueue > 0:
+        queue = ", Message queue: %d" % sendqueue
+    else:
+        queue = ""
+    topName = "Topology: %s, Total entries: %d, TTC: %s%s" % (mycontext['topology'], nentries, consistent, queue)
     content = mycontext['boardcontents_template'] %( title, topName, entriesStr )
     fullpage_h = mycontext['frontpage_header_template'] + content
     fullpage = fullpage_h + mycontext['frontpage_footer_template'] % mycontext['authors']
@@ -541,6 +600,11 @@ if callfunc == 'initialize':
     mycontext['frontpage_footer_template'] = file("board_frontpage_footer_template.html").read()
  
     mycontext['entries'] = {"%s:%d" % (ip, port): {}}
+    mycontext['send_lock'] = getlock()
+    mycontext['send_queue'] = []
+    mycontext['send_thread'] = False
+    mycontext['outsockets'] = 20
+    print "Outsockets limit: %d" % 20
 
     # Read neighbors
     mycontext['neighborlist'] = []
