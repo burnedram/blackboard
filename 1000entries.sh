@@ -6,13 +6,22 @@ if [ -z "$1" ]; then
 else
     TOTAL=$(($1))
 fi
-PARALLEL=25
+if [ -z "$2" ]; then
+    PARALLEL=10
+else
+    PARALLEL=$(($2))
+fi
 IPS=($(./get_neighborlist.sh))
 PARALLEL=$((PARALLEL * ${#IPS[*]}))
 
 function add_entry {
-    curl -d "entry=$2" -X 'POST' "http://$1/entries" &>/dev/null
-    printf "."
+    timeout 60 curl -d "entry=$2" -X 'POST' "http://$1/entries" &>/dev/null
+    if [ $? -eq 124 ]; then
+        printf "+"
+        add_entry "$1" "$2"
+    else
+        printf "."
+    fi
 }
 
 function run_next {
@@ -30,7 +39,7 @@ for i in $(seq 1 $PARALLEL); do
     run_next
 done
 while [ $ENTRIES -lt $TOTAL ]; do
-    wait
+    sleep 0.1
 done
 wait
 printf "\nDone\n"
