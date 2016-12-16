@@ -412,8 +412,8 @@ def resolve_add_board(msgheader, sockobj, thiscommhandle):
     finally:
         unlock()
 
-    #if repost:
-        #send_neighbors(msgheader)
+    if repost:
+        send_neighbors(msgheader)
 
 # ------------------------------------------------------------------------------
 # Handles syncing changes to entries between clients
@@ -438,8 +438,8 @@ def resolve_modify_board(msgheader, sockobj, thiscommhandle):
     finally:
         unlock()
 
-    #if repost:
-        #send_neighbors(msgheader)
+    if repost:
+        send_neighbors(msgheader)
 
 # ------------------------------------------------------------------------------
 # Handles deleting entries between clients
@@ -462,8 +462,8 @@ def resolve_delete_board(msgheader, sockobj, thiscommhandle):
     finally:
         unlock()
 
-    #if repost:
-        #send_neighbors(msgheader)
+    if repost:
+        send_neighbors(msgheader)
 
 # ------------------------------------------------------------------------------
 # Handles other requests, outputs 404
@@ -524,14 +524,14 @@ def generate_html_page():
     #Initialize blackboard content
     
     entries = []
-    #for msgid in range(mycontext['logic_clock'] + 1):
-    #    for origin in mycontext['entries']:
-    #        if msgid not in mycontext['entries'][origin] or is_entry_deleted(origin, msgid):
-    #            continue
-    #        msg = mycontext['entries'][origin][msgid]
-    #        boardid = "%d@%s" % (msgid, origin)
-    #        entries.append(mycontext['entry_template'] \
-    #            %('entries/%s' % (boardid), boardid, msg['msg']))
+    for msgid in range(mycontext['logic_clock'] + 1):
+        for origin in mycontext['entries']:
+            if msgid not in mycontext['entries'][origin] or is_entry_deleted(origin, msgid):
+                continue
+            msg = mycontext['entries'][origin][msgid]
+            boardid = "%d@%s" % (msgid, origin)
+            entries.append(mycontext['entry_template'] \
+                %('entries/%s' % (boardid), boardid, msg['msg']))
     entriesStr = "".join(entries)
 
     # dynamic title showing Ip address, port, up time and current topology. 
@@ -605,6 +605,8 @@ if callfunc == 'initialize':
     mycontext['send_threads'] = 0
     mycontext['outsockets'] = 20
     print "Outsockets limit: %d" % 20
+    mycontext['post_begin'] = 0
+    mycontext['post_end'] = 0
 
     # Read neighbors
     mycontext['neighborlist'] = []
