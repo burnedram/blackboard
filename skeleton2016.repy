@@ -217,7 +217,7 @@ def post_board_handler(msgheader, sockobj, thiscommhandle):
             nentries = count_entries()
             if nentries == 1:
                 mycontext['post_begin'] = getruntime()
-            elif nentries == 1000:
+            else:
                 mycontext['post_end'] = getruntime()
     finally:
         unlock()
@@ -239,68 +239,68 @@ def send_to(nodes, msg):
     unsent = []
     for neighbor in nodes:
         unsent.append({'ip': neighbor['ip'], 'port': neighbor['port'], 'msg': msg})
+    spawn_new = False
     mycontext['send_lock'].acquire()
     try:
-        has_captian = mycontext['send_thread']
-        mycontext['send_thread'] = True
+        threads = mycontext['send_threads']
+        maxthreads = mycontext['outsockets']
+        if threads < maxthreads:
+            mycontext['send_threads'] += 1
+            spawn_new = True
         mycontext['send_queue'] += unsent
     finally:
         mycontext['send_lock'].release()
-    if not has_captian:
+    if spawn_new:
         thread_send_to()
 
 def thread_send_to():
-    max_socks = mycontext['outsockets'] + 5
-    unsent = []
+    unsent = None
     while True:
-        mycontext['send_lock'].acquire()
-        try:
-            if unsent:
-                mycontext['send_queue'] = unsent + mycontext['send_queue']
-            unsent = mycontext['send_queue'][:max_socks]
-            if not unsent:
-                mycontext['send_thread'] = False
+        if unsent is None:
+            mycontext['send_lock'].acquire()
+            try:
+                if not mycontext['send_queue']:
+                    mycontext['send_threads'] -= 1
+                    return
+                unsent = mycontext['send_queue'][0]
+                mycontext['send_queue'] = mycontext['send_queue'][1:]
+            finally:
+                mycontext['send_lock'].release()
+        status = send_to_guarded(unsent)
+        if status == "ok":
+            unsent = None
+            continue
+        elif status == "outsockets":
+            mycontext['send_lock'].acquire()
+            try:
+                mycontext['send_threads'] -= 1
+                mycontext['outsockets'] -= 1
+                mycontext['send_queue'].insert(0, unsent)
+                print "Outsockets limit: %d" % mycontext['outsockets']
                 return
-            mycontext['send_queue'] = mycontext['send_queue'][len(unsent):]
-        finally:
-            mycontext['send_lock'].release()
-        unsent = send_to_guarded(unsent)
-        max_socks = mycontext['outsockets']
+            finally:
+                mycontext['send_lock'].release()
+        elif status == "retry":
+            continue
 
 def send_to_guarded(unsent):
-    still_unsent = []
-    socks = []
-    for neighbor in unsent:
-        try:
-            nsock = openconn(neighbor['ip'], neighbor['port'])
-            nsock.send(neighbor['msg'])
-            socks.append({'ip': neighbor['ip'], 'port': neighbor['port'], 'sock': nsock})
-        except Exception, e:
-            if str(e) == "Resource 'outsockets' limit exceeded!!":
-                still_unsent.append(neighbor)
-                if mycontext['outsockets'] != len(socks):
-                    mycontext['outsockets'] = len(socks)
-                    print "Outsockets limit: %d" % len(socks)
-            elif str(e) == "Connection timed out!" or \
-                    str(e) == "timed out":
-                still_unsent.append(neighbor)
-                print str(e)
-            else:
-                print "Exception in send_to_guarded/1: %s, %s [%s:%d]\n" \
-                    %(type(e), e, neighbor['ip'], neighbor['port'])
-    for neighbor in socks:
-        try:
-            nsock = neighbor['sock']
-            rsock = nsock.recv(2)
-        except Exception, e:
-            print "Exception in send_to_guarded/2: %s, %s [%s:%d]\n" \
-                %(type(e), e, neighbor['ip'], neighbor['port'])
-        finally:
-            try:
-                nsock.close()
-            except Exception, e:
-                pass
-    return still_unsent
+    try:
+        nsock = openconn(unsent['ip'], unsent['port'])
+        nsock.send(unsent['msg'])
+        nsock.recv(2)
+        nsock.close()
+        return "ok"
+    except Exception, e:
+        if str(e) == "Resource 'outsockets' limit exceeded!!":
+            return "outsockets"
+        elif str(e) == "Connection timed out!" or \
+                str(e) == "timed out":
+            print "%s [%s:%d]" % (e, unsent['ip'], unsent['port'])
+            return "retry"
+        else:
+            print "Exception in send_to_guarded: %s, %s [%s:%d]\n" \
+                %(type(e), e, unsent['ip'], unsent['port'])
+            return "ok"
 
 # ------------------------------------------------------------------------------
 # Locks the board
@@ -407,7 +407,7 @@ def resolve_add_board(msgheader, sockobj, thiscommhandle):
             nentries = count_entries()
             if nentries == 1:
                 mycontext['post_begin'] = getruntime()
-            elif nentries == 1000:
+            else:
                 mycontext['post_end'] = getruntime()
     finally:
         unlock()
@@ -537,10 +537,10 @@ def generate_html_page():
     # dynamic title showing Ip address, port, up time and current topology. 
     title='Segmented network @ %s:%d. Up time: %ds' %( str(mycontext['ip']), mycontext['port'], int(getruntime()) )
     nentries = count_entries()
-    if nentries >= 1000:
-        consistent = "%ds" % (mycontext['post_end'] - mycontext['post_begin'])
+    if nentries == 0:
+        consistent = "N/A"
     else:
-        consistent = "Not consistent"
+        consistent = "%ds" % (mycontext['post_end'] - mycontext['post_begin'])
     sendqueue = len(mycontext['send_queue'])
     if sendqueue > 0:
         queue = ", Message queue: %d" % sendqueue
@@ -602,7 +602,7 @@ if callfunc == 'initialize':
     mycontext['entries'] = {"%s:%d" % (ip, port): {}}
     mycontext['send_lock'] = getlock()
     mycontext['send_queue'] = []
-    mycontext['send_thread'] = False
+    mycontext['send_threads'] = 0
     mycontext['outsockets'] = 20
     print "Outsockets limit: %d" % 20
 
